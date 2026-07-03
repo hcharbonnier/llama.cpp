@@ -787,6 +787,8 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+struct llama_moe_stream;
+
 struct llm_graph_params {
     const llama_model * model = nullptr;
 
@@ -812,6 +814,9 @@ struct llm_graph_params {
 
     ggml_tensor * layer_inp_dev = nullptr; // own layer input device buffer (write)
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
+
+    // MoE expert SSD streaming state of the model, null when not enabled
+    llama_moe_stream * mstream = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1077,6 +1082,8 @@ struct llm_graph_context {
     ggml_tensor * layer_inp_dev;
     ggml_tensor * layer_inp_src;
 
+    llama_moe_stream * mstream;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -1122,12 +1129,14 @@ struct llm_graph_context {
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
+    // ids_scale: ids to use for the w_s gather, when the GEMM ids are remapped cache slots (MoE streaming)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+              ggml_tensor * slots = nullptr,
+              ggml_tensor * ids_scale = nullptr) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range

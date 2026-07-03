@@ -18,6 +18,7 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 struct llama_model;
+struct llama_moe_stream;
 
 // available models
 enum llm_type {
@@ -986,6 +987,10 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // MoE expert SSD streaming state, null when not enabled
+    // the pointee is mutable (residency changes during decode), only the pointer is owned here
+    llama_moe_stream * moe_stream() const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     // the RoPE of a layer, used by both the model graph and the K-shift
@@ -1036,8 +1041,9 @@ struct llama_model_base : public llama_model {
     const int TENSOR_NOT_REQUIRED;
     const int TENSOR_SKIP;
     const int TENSOR_SKIP_IF_VIRTUAL;
-    const int TENSOR_ALLOW_RESHAPE;
+const int TENSOR_ALLOW_RESHAPE;
     const int TENSOR_READ_LAZY;
+    const int TENSOR_STREAMED;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;

@@ -591,6 +591,8 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
         LOG_INF("%s:    graphs reused = %10d\n", __func__, data.n_reused);
         LOG_INF("%s:   graph reallocs = %10d    / %5d        (same size) / (changed size)\n", __func__, data.n_reallocs_same, data.n_reallocs_diff);
 
+        llama_moe_stream_print_stats(llama_get_model(ctx));
+
         common_memory_breakdown_print(ctx);
     }
 }
