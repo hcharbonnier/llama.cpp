@@ -1427,7 +1427,8 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
-void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps,
+        const std::map<uint32_t, llama_mmap::ranges> * skip_ranges) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1448,12 +1449,29 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+            // ranges kept out of the prefetch: lazy tensors plus data that is read on demand
+            // (SSD-streamed expert tensors)
+            llama_mmap::ranges lazy_ranges = lazy.for_file(idx);
+            if (skip_ranges) {
+                const auto it = skip_ranges->find(idx);
+                if (it != skip_ranges->end()) {
+                    lazy_ranges.insert(lazy_ranges.end(), it->second.begin(), it->second.end());
+                }
+            }
+
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa, lazy_ranges);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
                 mlock_mmap->init(mapping->addr());
+                if (skip_ranges) {
+                    const auto it = skip_ranges->find(idx);
+                    if (it != skip_ranges->end()) {
+                        for (const auto & range : it->second) {
+                            mlock_mmap->add_hole(range.first, range.second);
+                        }
+                    }
+                }
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
             mappings.emplace_back(std::move(mapping));

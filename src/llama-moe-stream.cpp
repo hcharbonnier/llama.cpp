@@ -11,7 +11,12 @@
 #include <stdexcept>
 
 #ifdef _WIN32
+#include <io.h>
 #include <malloc.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -60,16 +65,29 @@ static void moe_aligned_free(void * p) {
 static const uint8_t * llama_moe_stream_pread(llama_file & file, uint8_t * staging, size_t len, size_t offs, bool direct) {
 #ifdef _WIN32
     GGML_UNUSED(direct);
-    // no positional read primitive; serialize the seek+read pairs
-    static std::mutex io_mtx;
-    std::lock_guard<std::mutex> lock(io_mtx);
-    try {
-        file.seek(offs, SEEK_SET);
-        file.read_raw(staging, len);
-        return staging;
-    } catch (...) {
+    // ReadFile with an explicit offset is a positional read, so the I/O workers do not share a
+    // file pointer and can load experts in parallel
+    const intptr_t os_handle = _get_osfhandle(file.file_id());
+    if (os_handle == -1) {
         return nullptr;
     }
+    uint8_t * p    = staging;
+    size_t    left = len;
+    ULONGLONG off  = (ULONGLONG) offs;
+    while (left > 0) {
+        OVERLAPPED ov = {};
+        ov.Offset     = (DWORD) (off & 0xffffffffull);
+        ov.OffsetHigh = (DWORD) (off >> 32);
+        const DWORD chunk = (DWORD) std::min<size_t>(left, (size_t) 1 << 30);
+        DWORD nread = 0;
+        if (!ReadFile((HANDLE) os_handle, p, chunk, &nread, &ov) || nread == 0) {
+            return nullptr;
+        }
+        p    += nread;
+        off  += nread;
+        left -= nread;
+    }
+    return staging;
 #else
     const int fd = file.file_id();
 
@@ -256,12 +274,22 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
         }
     }
 
+    file_paths = paths;
+
     auto open_all = [&](bool direct) {
         files.clear();
         for (const auto & path : paths) {
             files.emplace_back(new llama_file(path.c_str(), "rb", direct));
         }
     };
+
+#ifdef _WIN32
+    if (use_direct_io) {
+        // llama_file::has_direct_io() is true on Windows but there is no O_DIRECT equivalent
+        LLAMA_LOG_WARN("%s: O_DIRECT is not supported on Windows, falling back to buffered streaming reads\n", __func__);
+        use_direct_io = false;
+    }
+#endif
 
     open_all(use_direct_io);
 
@@ -297,6 +325,17 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
     hot_decay_interval = MOE_STREAM_HOT_DECAY_TOKENS * n_streamed;
 }
 
+void llama_moe_stream::file_ranges(std::map<uint32_t, llama_mmap::ranges> & out) const {
+    for (const auto & sl : layers) {
+        if (!sl) {
+            continue;
+        }
+        for (const auto & wt : sl->weights) {
+            out[wt.file_idx].emplace_back(wt.offs, wt.offs + wt.nb_expert*sl->n_expert);
+        }
+    }
+}
+
 // spawn the I/O thread pool on first use (from the remap callback, under mtx)
 void llama_moe_stream::start_workers_locked() {
     if (workers_started) {
@@ -316,6 +355,22 @@ void llama_moe_stream::worker_loop() {
     // length; O_DIRECT needs the extra head/tail slack for its aligned reads)
     uint8_t * staging = (uint8_t *) moe_aligned_alloc(max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN);
     GGML_ASSERT(staging != nullptr);
+
+#ifdef _WIN32
+    // each worker opens its own handles: concurrent reads on one synchronous file object serialize
+    llama_files worker_files;
+    try {
+        for (const auto & path : file_paths) {
+            worker_files.emplace_back(new llama_file(path.c_str(), "rb", false));
+        }
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(mtx);
+        load_failed = true;
+        cv_done.notify_all();
+        moe_aligned_free(staging);
+        return;
+    }
+#endif
 
     std::unique_lock<std::mutex> lk(mtx);
     while (true) {
@@ -340,7 +395,12 @@ void llama_moe_stream::worker_loop() {
 
         bool ok = true;
         for (const auto & wt : sl.weights) {
-            const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], staging, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
+#ifdef _WIN32
+            llama_file & wf = *worker_files[wt.file_idx];
+#else
+            llama_file & wf = *files[wt.file_idx];
+#endif
+            const uint8_t * data = llama_moe_stream_pread(wf, staging, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
             if (data == nullptr) {
                 ok = false;
                 break;

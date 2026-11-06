@@ -4971,8 +4971,10 @@ void llama_perf_context_print(const llama_context * ctx) {
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
 LLAMA_LOG_INFO("%s:   graph reallocs = %10d    / %5d        (same size) / (changed size)\n", __func__, data.n_reallocs_same, data.n_reallocs_diff);
 
-    if (const auto * mstream = ctx->get_model().moe_stream()) {
-        mstream->print_stats();
+    if (ctx) {
+        if (const auto * mstream = ctx->get_model().moe_stream()) {
+            mstream->print_stats();
+        }
     }
 }
 

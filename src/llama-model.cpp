@@ -1721,6 +1721,8 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
         return 0;
     }
 
+    const bool cache_from_params = params.moe_stream_slots > 0 || params.moe_stream_budget > 0;
+
     uint32_t n_slots = params.moe_stream_slots;
 
     if (n_slots == 0 && params.moe_stream_budget > 0) {
@@ -1737,7 +1739,24 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
     }
 
     if (n_slots == 0) {
-        n_slots = std::clamp<uint32_t>(2*hparams.n_expert_used_max(), 16, hparams.n_expert);
+        n_slots = std::max<uint32_t>(2*hparams.n_expert_used_max(), 16);
+    }
+
+    // multi-pass prefill keeps the current wave, the preloaded next wave and n_expert_used
+    // parking slots resident at once, so a wave needs at least 3*n_expert_used experts
+    const uint32_t n_slots_min = 3*hparams.n_expert_used_max();
+    if (n_slots < n_slots_min) {
+        if (cache_from_params || n_slots_min >= hparams.n_expert) {
+            // keep the cache below 3*n_expert_used: an explicit --moe-stream-cache is a hard
+            // cap, and a cache large enough for multi-pass prefill would cover all experts and
+            // disable streaming entirely - large batches fail at graph build instead
+            LLAMA_LOG_WARN("%s: MoE expert cache of %u slots is below the %u needed for multi-pass prefill (3*n_expert_used); large batches will fail -- increase --moe-stream-cache or reduce -ub\n",
+                    __func__, n_slots, n_slots_min);
+        } else {
+            LLAMA_LOG_WARN("%s: raising MoE expert cache from %u to %u slots (3*n_expert_used)\n",
+                    __func__, n_slots, n_slots_min);
+            n_slots = n_slots_min;
+        }
     }
 
     if (n_slots >= hparams.n_expert) {
@@ -2074,7 +2093,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // MoE expert streaming reads experts from the GGUF on demand: keep the streamed expert
+    // ranges out of the mmap prefetch and mlock, or that data is faulted into RAM and defeats
+    // streaming; the other weights are still prefetched and locked as usual
+    std::map<uint32_t, llama_mmap::ranges> moe_skip_ranges;
+    if (pimpl->moe_stream && !pimpl->moe_stream->ctxs.empty()) {
+        pimpl->moe_stream->file_ranges(moe_skip_ranges);
+    }
+    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr,
+            moe_skip_ranges.empty() ? nullptr : &moe_skip_ranges);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers

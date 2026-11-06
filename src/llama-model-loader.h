@@ -246,7 +246,8 @@ static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
 
     void done_getting_tensors(bool partial = false) const;
 
-    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
+    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr,
+            const std::map<uint32_t, llama_mmap::ranges> * skip_ranges = nullptr);
 
     // byte range within a mapped file
     struct mapping_range {

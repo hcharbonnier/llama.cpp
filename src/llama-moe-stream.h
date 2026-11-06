@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -138,11 +139,19 @@ struct llama_moe_stream {
 
     size_t size_bufs() const;
 
+    // file ranges [first, last) of the streamed expert data, per GGUF file index; used to keep
+    // the mmap prefetch and mlock off the data that is streamed from disk
+    void file_ranges(std::map<uint32_t, llama_mmap::ranges> & out) const;
+
     void print_stats() const;
 
     bool use_direct_io = false; // O_DIRECT streaming reads (LLAMA_MOE_STREAM_DIRECT), no page cache
 
     llama_files files; // privately reopened GGUF files, same indices as the loader's
+
+    // file paths, so each I/O worker can open its own handle (Windows synchronous I/O serializes
+    // concurrent reads on a shared handle)
+    std::vector<std::string> file_paths;
 
     size_t  max_nb_expert      = 0;
     int64_t hot_decay_interval = 0; // remap calls between route-hotness halvings (0 = no decay)

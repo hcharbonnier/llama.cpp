@@ -800,6 +800,32 @@ struct llama_mlock::impl {
         addr = ptr;
     }
 
+    void add_hole(size_t first, size_t last) {
+        GGML_ASSERT(size == 0 && "add_hole() must be called before grow_to()");
+        if (first >= last) {
+            return;
+        }
+
+        // expand to the lock granularity: mlock faults in every page that overlaps the locked
+        // range, so holes must cover whole pages or on-demand data would be faulted in anyway
+        const size_t granularity = lock_granularity();
+        first &= ~(granularity - 1);
+        last   = (last + granularity - 1) & ~(granularity - 1);
+
+        holes.emplace_back(first, last);
+        std::sort(holes.begin(), holes.end());
+
+        size_t n = 0;
+        for (const auto & hole : holes) {
+            if (n > 0 && hole.first <= holes[n - 1].second) {
+                holes[n - 1].second = std::max(holes[n - 1].second, hole.second);
+            } else {
+                holes[n++] = hole;
+            }
+        }
+        holes.resize(n);
+    }
+
     void grow_to(size_t target_size) {
         GGML_ASSERT(addr);
         if (failed_already) {
@@ -807,17 +833,36 @@ struct llama_mlock::impl {
         }
         size_t granularity = lock_granularity();
         target_size = (target_size + granularity - 1) & ~(granularity - 1);
-        if (target_size > size) {
-            if (raw_lock((uint8_t *) addr + size, target_size - size)) {
-                size = target_size;
-            } else {
-                failed_already = true;
-            }
+        if (target_size <= size) {
+            return;
         }
+
+        // lock [size, target_size) minus the holes
+        size_t pos = size;
+        for (const auto & hole : holes) {
+            if (hole.second <= pos) {
+                continue;
+            }
+            if (hole.first >= target_size) {
+                break;
+            }
+            if (hole.first > pos && !raw_lock((uint8_t *) addr + pos, hole.first - pos)) {
+                failed_already = true;
+                return;
+            }
+            pos = std::max(pos, hole.second);
+        }
+        if (pos < target_size && !raw_lock((uint8_t *) addr + pos, target_size - pos)) {
+            failed_already = true;
+            return;
+        }
+        size = target_size;
     }
 
     void * addr;
     size_t size;
+
+    std::vector<std::pair<size_t, size_t>> holes; // sorted, page-aligned ranges that stay unlocked
 
     bool failed_already;
 };
@@ -827,6 +872,7 @@ llama_mlock::~llama_mlock() = default;
 
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
+void llama_mlock::add_hole(size_t first, size_t last) { pimpl->add_hole(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mlock::SUPPORTED = true;

@@ -72,6 +72,9 @@ struct llama_mlock {
     void init(void * ptr);
     void grow_to(size_t target_size);
 
+    // keep [first, last) unlocked, e.g. data that is read from disk on demand; call before grow_to
+    void add_hole(size_t first, size_t last);
+
     static const bool SUPPORTED;
 
 private:
