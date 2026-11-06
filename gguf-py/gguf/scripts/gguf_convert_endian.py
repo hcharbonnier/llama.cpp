@@ -41,6 +41,7 @@ byteswap_tensors: dict[gguf.GGMLQuantizationType, tuple[tuple[int, type[np.unsig
     gguf.GGMLQuantizationType.MXFP4:  (),                                                  # noop
     gguf.GGMLQuantizationType.NVFP4:  (),                                                  # noop
     gguf.GGMLQuantizationType.F8_E4M3: (),                                                 # noop
+    gguf.GGMLQuantizationType.MXFP8:   (),                                                 # noop
 }
 
 

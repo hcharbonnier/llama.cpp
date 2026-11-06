@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable, Iterable, TYPE_CHECKING, cast
@@ -131,6 +132,7 @@ class DeepseekV41Model(DeepseekV4Model):
         super().__init__(*args, **kwargs)
         self.hparams.setdefault("num_hash_layers", 0)  # no hash-routed layers in V4.1
         self._f32 = self.ftype == gguf.LlamaFileType.ALL_F32
+        self._engram_mxfp8 = os.environ.get("DSV41_ENGRAM_TYPE", "bf16").lower() == "mxfp8"
         qc = self.hparams.get("quantization_config") or {}
         self._fp8_block = tuple(qc.get("weight_block_size") or (32, 32))
         if qc.get("scale_fmt", "ue8m0") != "ue8m0":
@@ -235,6 +237,22 @@ class DeepseekV41Model(DeepseekV4Model):
         assert dim is not None
         name = self.format_tensor_name(gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD)
         n_rows = sum(p[2] for p in parts)
+
+        if self._engram_mxfp8:
+            def blocks() -> Iterable[np.ndarray]:
+                from safetensors import safe_open
+                for wn, sn, rows, wpart, spart in parts:
+                    with safe_open(wpart, framework="pt") as fw, safe_open(spart, framework="pt") as fs:
+                        ws, ss = fw.get_slice(wn), fs.get_slice(sn)
+                        for r0 in range(0, rows, 1 << 18):
+                            q = ws[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 32)
+                            e = ss[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 1)
+                            if (e == 0xFF).any() or ((q & 0x7F) == 0x7F).any():
+                                raise ValueError(f"{wn}: NaN E8M0 scale or E4M3 code")
+                            yield np.concatenate([e.numpy(), q.numpy()], axis=1)
+            data = cast(np.ndarray, _StreamedBytes((n_rows, dim // 32 * 33), blocks))
+            self.gguf_writer.add_tensor(name, data, raw_dtype=gguf.GGMLQuantizationType.MXFP8)
+            return
 
         def chunks() -> Iterable[np.ndarray]:
             from safetensors import safe_open

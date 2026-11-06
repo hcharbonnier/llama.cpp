@@ -533,6 +533,25 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
 
+// GGUF files from the original DeepSeek-V4.1 MXFP8 branch wrote the Engram table with type id 43,
+// which later became F8_E4M3. Recover the intended MXFP8 type for that tensor only.
+static void remap_legacy_engram_type(enum llm_arch arch, struct ggml_tensor * t) {
+    if (arch != LLM_ARCH_DEEPSEEK41 || t->type != GGML_TYPE_F8_E4M3) {
+        return;
+    }
+    if (strcmp(t->name, "per_layer_token_embd.weight") != 0) {
+        return;
+    }
+
+    t->type  = GGML_TYPE_MXFP8;
+    t->nb[0] = ggml_type_size(t->type);
+    t->nb[1] = t->nb[0]*(t->ne[0]/ggml_blck_size(t->type));
+    for (int i = 2; i < GGML_MAX_DIMS; ++i) {
+        t->nb[i] = t->nb[i - 1]*t->ne[i - 1];
+    }
+
+    LLAMA_LOG_WARN("%s: tensor '%s' uses the legacy MXFP8 type id, reading it as mxfp8\n", __func__, t->name);
+}
 
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
@@ -589,6 +608,8 @@ llama_model_loader::llama_model_loader(
         // For subsidiary files, `meta` tensor data offset must not be used,
         // so we build a unified tensors index for weights.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            remap_legacy_engram_type(llm_kv.arch, cur);
+
             std::string tensor_name = std::string(cur->name);
             // make sure there is no duplicated tensor names
             if (weights_map.find(tensor_name) != weights_map.end()) {
@@ -656,6 +677,8 @@ llama_model_loader::llama_model_loader(
 
                 // Save tensors data offset info of the shard.
                 for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                    remap_legacy_engram_type(llm_kv.arch, cur);
+
                     std::string tensor_name = std::string(cur->name);
                     // make sure there is no duplicated tensor names
                     if (weights_map.find(tensor_name) != weights_map.end()) {
