@@ -434,7 +434,13 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_F8_E4M3 = 43,
         GGML_TYPE_MXFP8   = 44, // MXFP8 (E4M3, E8M0 scale), gather-only
-        GGML_TYPE_COUNT   = 45,
+        // IQ1_S's 8-element ternary codebook with a narrower index; see ggml-common.h.
+        // 45..63 stay reserved for upstream, so fork-local types start at 64 and a stock
+        // build rejects these files instead of misreading them.
+        GGML_TYPE_IQ1_XS   = 64, // 1.4375 bpw, 1024-entry grid
+        GGML_TYPE_IQ1_XXS  = 65, // 1.3125 bpw,  512-entry grid
+        GGML_TYPE_IQ1_XXXS = 66, // 1.1875 bpw,  256-entry grid
+        GGML_TYPE_COUNT   = 67,
     };
 
     // [TAG_GGML_PREC]
@@ -491,6 +497,10 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_F8_E4M3 = 29, // except 1d tensors
+        // 30..39 are reserved for upstream ggml.
+        GGML_FTYPE_MOSTLY_IQ1_XS   = 40, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ1_XXS  = 41, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ1_XXXS = 42, // except 1d tensors
     };
 
     // available tensor operations:
