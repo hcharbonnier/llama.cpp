@@ -1721,10 +1721,9 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
         return 0;
     }
 
-    const bool cache_from_params = params.moe_stream_slots > 0 || params.moe_stream_budget > 0;
-
     uint32_t n_slots = params.moe_stream_slots;
 
+    bool cache_from_budget = false;
     if (n_slots == 0 && params.moe_stream_budget > 0) {
         // derive the per-layer slot count from the total byte budget
         size_t nb_expert_sum = 0; // bytes of one expert across every streamable layer
@@ -1735,8 +1734,11 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
         }
         if (nb_expert_sum > 0) {
             n_slots = std::max<uint64_t>(params.moe_stream_budget/nb_expert_sum, hparams.n_expert_used_max());
+            cache_from_budget = true;
         }
     }
+
+    const bool cache_from_params = params.moe_stream_slots > 0 || cache_from_budget;
 
     if (n_slots == 0) {
         n_slots = std::max<uint32_t>(2*hparams.n_expert_used_max(), 16);
@@ -1745,18 +1747,24 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
     // multi-pass prefill keeps the current wave, the preloaded next wave and n_expert_used
     // parking slots resident at once, so a wave needs at least 3*n_expert_used experts
     const uint32_t n_slots_min = 3*hparams.n_expert_used_max();
+
+    if (n_slots_min >= hparams.n_expert) {
+        // a cache this large would hold every expert, so streaming cannot help for this model
+        LLAMA_LOG_WARN("%s: MoE expert streaming needs at least %u slots (3*n_expert_used) for multi-pass prefill, but the model has only %u experts -- streaming disabled, loading normally\n",
+                __func__, n_slots_min, hparams.n_expert);
+        return 0;
+    }
+
     if (n_slots < n_slots_min) {
-        if (cache_from_params || n_slots_min >= hparams.n_expert) {
-            // keep the cache below 3*n_expert_used: an explicit --moe-stream-cache is a hard
-            // cap, and a cache large enough for multi-pass prefill would cover all experts and
-            // disable streaming entirely - large batches fail at graph build instead
-            LLAMA_LOG_WARN("%s: MoE expert cache of %u slots is below the %u needed for multi-pass prefill (3*n_expert_used); large batches will fail -- increase --moe-stream-cache or reduce -ub\n",
-                    __func__, n_slots, n_slots_min);
-        } else {
-            LLAMA_LOG_WARN("%s: raising MoE expert cache from %u to %u slots (3*n_expert_used)\n",
-                    __func__, n_slots, n_slots_min);
-            n_slots = n_slots_min;
+        if (cache_from_params) {
+            // an explicit --moe-stream-cache is a hard budget: fail at load instead of hitting
+            // the graph-build abort on the first batch that needs multi-pass prefill
+            throw std::runtime_error(format("%s: --moe-stream-cache gives %u slots per layer, but multi-pass prefill needs at least %u (3*n_expert_used); increase --moe-stream-cache or reduce -ub",
+                    __func__, n_slots, n_slots_min));
         }
+        LLAMA_LOG_WARN("%s: raising MoE expert cache from %u to %u slots (3*n_expert_used)\n",
+                __func__, n_slots, n_slots_min);
+        n_slots = n_slots_min;
     }
 
     if (n_slots >= hparams.n_expert) {
