@@ -2434,19 +2434,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     uint32_t n_stream_waves  = 1;
     uint32_t stream_wave_cap = 0;
     if (msl) {
-        // worst-case distinct experts: n_expert_used per token, but never more than n_expert total
-        const uint64_t n_touch_max = std::min<uint64_t>((uint64_t) n_expert, (uint64_t) n_tokens*n_expert_used);
-        if (n_touch_max > msl->n_slots) {
+        // worst-case distinct experts: n_expert_used per token, but never more than n_expert total;
+        //   the pinned partition is always resident, so only the dynamic slots bound the waves
+        const uint32_t n_dyn = msl->n_slots - msl->n_pinned;
+        const uint64_t n_touch_max = std::min<uint64_t>(
+                (uint64_t) (n_expert - (int64_t) msl->n_pinned), (uint64_t) n_tokens*n_expert_used);
+        if (n_touch_max > n_dyn) {
             // the cache must hold three sets at once: this wave's experts, the next wave's preloaded
             //   experts (so its loads overlap this wave's compute), and n_expert_used parking slots
             //   the masked-out pairs GEMM against (Metal needs a slot at most once per token row).
-            //   so cap + cap + n_expert_used = n_slots -> cap = (n_slots - n_expert_used)/2
-            stream_wave_cap = msl->n_slots > (uint32_t) n_expert_used ? (msl->n_slots - (uint32_t) n_expert_used)/2 : 0;
+            //   so cap + cap + n_expert_used = n_dyn -> cap = (n_dyn - n_expert_used)/2
+            stream_wave_cap = n_dyn > (uint32_t) n_expert_used ? (n_dyn - (uint32_t) n_expert_used)/2 : 0;
             if (stream_wave_cap < (uint32_t) n_expert_used) {
-                // a wave must fit at least n_expert_used experts, i.e. n_slots >= 3*n_expert_used
-                GGML_ABORT("MoE expert streaming: multi-pass expert GEMMs need an expert cache of at least "
-                           "3*n_expert_used slots (have %u, need %u); increase --moe-stream-cache or reduce -ub",
-                        msl->n_slots, 3*(uint32_t) n_expert_used);
+                // a wave must fit at least n_expert_used experts, i.e. n_dyn >= 3*n_expert_used
+                GGML_ABORT("MoE expert streaming: multi-pass expert GEMMs need at least 3*n_expert_used "
+                           "dynamic slots (have %u, need %u); increase --moe-stream-cache or reduce -ub",
+                        n_dyn, 3*(uint32_t) n_expert_used);
             }
             n_stream_waves = (uint32_t) ((n_touch_max + stream_wave_cap - 1)/stream_wave_cap); // ceil(n_touch_max/cap)
         }

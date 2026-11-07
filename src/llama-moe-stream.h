@@ -28,6 +28,11 @@
 // decaying route hotness with an LRU tiebreak. Reads are buffered by default, or O_DIRECT with
 // LLAMA_MOE_STREAM_DIRECT=1 (bypasses the page cache; recommended when the model far exceeds RAM).
 //
+// The cache is partitioned: its low slots permanently hold the experts of the same ids and are
+// never evicted, the remaining slots form the dynamic pool the wave planner and the remap draw
+// from. A pinned host mirror holds the experts the partition does not cover, so their misses cross
+// PCIe instead of reading the model file, and no expert is stored twice between the two tiers.
+//
 // note: multiple contexts decoding the same streamed model concurrently are not supported -
 // one context can evict slots referenced by the other's in-flight graph.
 
@@ -46,6 +51,9 @@ struct llama_moe_stream_weight {
     uint16_t file_idx  = 0; // GGUF split file index
     size_t   offs      = 0; // file offset of the full exps tensor data
     size_t   nb_expert = 0; // bytes per expert slab
+
+    const uint8_t * host       = nullptr; // pinned host mirror of the unpinned experts, null when unmirrored
+    uint32_t        host_first = 0;       // first expert the mirror holds
 };
 
 struct llama_moe_stream_layer;
@@ -63,6 +71,7 @@ struct llama_moe_stream_layer {
     int32_t  il       = -1;
     uint32_t n_expert = 0;
     uint32_t n_slots  = 0;
+    uint32_t n_pinned = 0; // slots 0..n_pinned-1 permanently hold experts 0..n_pinned-1
 
     std::vector<llama_moe_stream_weight> weights; // 2 (fused gate_up + down) or 3 entries
 
@@ -115,11 +124,12 @@ struct llama_moe_stream_work {
 
 struct llama_moe_stream {
     uint32_t n_slots      = 0; // expert cache slots per streamed layer
+    uint32_t n_pinned     = 0; // largest per-layer resident partition, never evicted
     int32_t  n_io_threads = 0;
 
     std::vector<std::unique_ptr<llama_moe_stream_layer>> layers; // [n_layer], null = not streamed
 
-    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct);
+    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint64_t ram_budget);
     ~llama_moe_stream();
 
     llama_moe_stream_layer * layer(int32_t il) const {
@@ -137,6 +147,11 @@ struct llama_moe_stream {
     // reopen the GGUF files for streaming reads
     void open_files(const std::vector<std::string> & paths);
 
+    // the low slots permanently hold the experts of the same ids; the rest form the dynamic pool
+    void pin_partition(uint32_t n_expert_used);
+    // fill the pinned host mirror with the experts the partition does not cover
+    void fill_host_mirror();
+
     size_t size_bufs() const;
 
     // file ranges [first, last) of the streamed expert data, per GGUF file index; used to keep
@@ -152,6 +167,9 @@ struct llama_moe_stream {
     // file paths, so each I/O worker can open its own handle (Windows synchronous I/O serializes
     // concurrent reads on a shared handle)
     std::vector<std::string> file_paths;
+
+    size_t ram_budget = 0; // pinned host mirror budget in bytes
+    std::vector<ggml_backend_buffer_ptr> host_bufs;
 
     size_t  max_nb_expert      = 0;
     int64_t hot_decay_interval = 0; // remap calls between route-hotness halvings (0 = no decay)

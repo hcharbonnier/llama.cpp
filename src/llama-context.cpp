@@ -2779,13 +2779,21 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     }
 
     if (const auto * mstream = model.moe_stream()) {
-        // multi-pass streamed prefill adds a bounded number of extra nodes per wave per streamed layer
+        // multi-pass streamed prefill adds a bounded number of extra nodes per wave per streamed layer;
+        //   n_pinned may differ per layer, so take the worst-case wave count over the streamed layers
         const uint32_t n_eu = model.hparams.n_expert_used_max();
-        uint32_t cap = mstream->n_slots > n_eu ? (mstream->n_slots - n_eu)/2 : 0;
-        cap = std::max<uint32_t>(cap, 1);
-        const uint32_t n_touch_max = std::min<uint32_t>(model.hparams.n_expert, n_tokens*n_eu);
-        const uint32_t n_waves = (n_touch_max + cap - 1)/cap;
-        res += 24u*n_waves*(uint32_t) mstream->layers.size();
+        uint32_t n_waves_max = 1;
+        for (const auto & sl : mstream->layers) {
+            if (!sl) {
+                continue;
+            }
+            const uint32_t n_dyn = mstream->n_slots - sl->n_pinned;
+            uint32_t cap = n_dyn > n_eu ? (n_dyn - n_eu)/2 : 0;
+            cap = std::max<uint32_t>(cap, 1);
+            const uint32_t n_touch_max = std::min<uint32_t>(model.hparams.n_expert - sl->n_pinned, n_tokens*n_eu);
+            n_waves_max = std::max(n_waves_max, (n_touch_max + cap - 1)/cap);
+        }
+        res += 24u*n_waves_max*(uint32_t) mstream->layers.size();
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling

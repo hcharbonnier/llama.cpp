@@ -2793,6 +2793,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_CACHE"));
     add_opt(common_arg(
+        {"--moe-stream-ram"}, "N",
+        "host mirror for --moe-stream: pinned memory budget in GiB holding the experts the cache does not keep, "
+        "so their misses cross PCIe instead of reading the model file; implies --moe-stream (default: 0)",
+        [](common_params & params, int value) {
+            params.moe_stream = true;
+            params.moe_stream_ram = (uint64_t) std::max(0, value) * 1024ull * 1024ull * 1024ull;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_RAM"));
+    add_opt(common_arg(
         {"--moe-stream-io-threads"}, "N",
         "I/O threads for --moe-stream expert loads; implies --moe-stream (default: auto)",
         [](common_params & params, int value) {
