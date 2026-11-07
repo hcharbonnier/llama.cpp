@@ -2802,6 +2802,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_RAM"));
     add_opt(common_arg(
+        {"--moe-stream-pin"}, "N",
+        "max experts kept permanently resident per layer for --moe-stream, trading VRAM for fewer prefill waves "
+        "(0 = all spare slots); implies --moe-stream (default: 0)",
+        [](common_params & params, int value) {
+            params.moe_stream = true;
+            params.moe_stream_pin = (uint32_t) std::max(0, value);
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_PIN"));
+    add_opt(common_arg(
         {"--moe-stream-io-threads"}, "N",
         "I/O threads for --moe-stream expert loads; implies --moe-stream (default: auto)",
         [](common_params & params, int value) {

@@ -1869,7 +1869,7 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
 static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     void * ptr = g_ggml_sycl_enable_host_pinned_mem ?
                      ggml_backend_sycl_host_malloc(ggml_backend_sycl_host_buffer_type_device(buft), size) :
-                     aligned_malloc_host(TENSOR_ALIGNMENT, size);
+                     nullptr;
     if (ptr == nullptr) {
         // fallback to cpu buffer
         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
@@ -7183,7 +7183,7 @@ static void ggml_backend_sycl_device_get_props(ggml_backend_dev_t dev, ggml_back
     props->type        = ggml_backend_sycl_device_get_type(dev);
     ggml_backend_sycl_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
-    bool host_buffer = getenv("GGML_SYCL_NO_PINNED") == nullptr;
+    bool host_buffer = g_ggml_sycl_enable_host_pinned_mem && getenv("GGML_SYCL_NO_PINNED") == nullptr;
 #ifdef GGML_SYCL_NO_PEER_COPY
     bool events = false;
 #else

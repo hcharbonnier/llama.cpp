@@ -296,8 +296,21 @@ void * ggml_vk_host_malloc(size_t size) {
         entry.base = ptr;
         entry.size = alloc_size;
 
-        std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
-        vk_instance.host_allocations.push_back(std::move(entry));
+        {
+            std::unique_lock<std::shared_mutex> guard(vk_instance.host_allocations_mutex);
+            vk_instance.host_allocations.push_back(std::move(entry));
+        }
+
+        // host buffers are shared by all devices, so every import must succeed
+        for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
+            vk_buffer buf;
+            size_t offset;
+            ggml_vk_host_get(ggml_vk_get_device(i), ptr, buf, offset);
+            if (buf == nullptr) {
+                ggml_vk_host_free(ptr);
+                return nullptr;
+            }
+        }
         return ptr;
     }
 

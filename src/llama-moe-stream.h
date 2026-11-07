@@ -129,7 +129,7 @@ struct llama_moe_stream {
 
     std::vector<std::unique_ptr<llama_moe_stream_layer>> layers; // [n_layer], null = not streamed
 
-    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint64_t ram_budget);
+    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint64_t ram_budget, uint32_t pin_max);
     ~llama_moe_stream();
 
     llama_moe_stream_layer * layer(int32_t il) const {
@@ -169,6 +169,7 @@ struct llama_moe_stream {
     std::vector<std::string> file_paths;
 
     size_t ram_budget = 0; // pinned host mirror budget in bytes
+    uint32_t pin_max = 0;  // max pinned experts per layer, 0 = all spare slots
     std::vector<ggml_backend_buffer_ptr> host_bufs;
 
     size_t  max_nb_expert      = 0;
