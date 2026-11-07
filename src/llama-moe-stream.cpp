@@ -23,7 +23,7 @@
 #endif
 
 static const uint32_t MOE_STREAM_IO_THREADS_DEFAULT = 9;
-static const uint32_t MOE_STREAM_IO_THREADS_MAX     = 18;
+static const uint32_t MOE_STREAM_IO_THREADS_MAX     = 32;
 static const int64_t  MOE_STREAM_HOT_DECAY_TOKENS   = 64;
 
 // O_DIRECT alignment: 4096 is a multiple of any device logical block size (512/4096), so it is
@@ -160,6 +160,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
     layers.resize(n_layer);
 
     this->n_io_threads = n_io_threads <= 0 ? MOE_STREAM_IO_THREADS_DEFAULT : n_io_threads;
+    if ((uint32_t) this->n_io_threads > MOE_STREAM_IO_THREADS_MAX) {
+        LLAMA_LOG_WARN("%s: clamping MoE I/O threads from %d to %u\n", __func__, this->n_io_threads, MOE_STREAM_IO_THREADS_MAX);
+    }
     this->n_io_threads = std::min<int32_t>(this->n_io_threads, MOE_STREAM_IO_THREADS_MAX);
 
     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
@@ -351,9 +354,34 @@ void llama_moe_stream::start_workers_locked() {
 // I/O worker: pops a reserved load, reads its expert slab(s) from the GGUF file into the cache
 // slot, and marks the slot RESIDENT (or flags load_failed); stale/duplicate items are skipped
 void llama_moe_stream::worker_loop() {
-    // page-aligned staging (Metal private buffers require page-aligned source + page-multiple
-    // length; O_DIRECT needs the extra head/tail slack for its aligned reads)
-    uint8_t * staging = (uint8_t *) moe_aligned_alloc(max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN);
+    // pinned host staging when the device exposes it: pageable H2D copies are slow and serialize
+    //   on CUDA/ROCm, which back-pressures the expert reads themselves. page-aligned anyway
+    //   (Metal private buffers; O_DIRECT needs the extra head/tail slack for its aligned reads)
+    ggml_backend_buffer_ptr staging_buf;
+    uint8_t * staging = nullptr;
+    const size_t staging_size = max_nb_expert + 4*MOE_STREAM_DIRECT_ALIGN;
+
+    for (const auto & [buft, ctx] : ctxs) {
+        GGML_UNUSED(ctx);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        ggml_backend_buffer_type_t host_buft = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (host_buft == nullptr) {
+            continue;
+        }
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(host_buft, staging_size);
+        if (buf == nullptr) {
+            continue;
+        }
+        staging_buf.reset(buf);
+        staging = (uint8_t *) ggml_backend_buffer_get_base(buf);
+        break;
+    }
+    if (staging == nullptr) {
+        staging = (uint8_t *) moe_aligned_alloc(staging_size);
+    } else {
+        // O_DIRECT requires a 4096-aligned buffer; pinned allocations only guarantee 256 bytes
+        staging = (uint8_t *) (((uintptr_t) staging + MOE_STREAM_DIRECT_ALIGN - 1) & ~(uintptr_t)(MOE_STREAM_DIRECT_ALIGN - 1));
+    }
     GGML_ASSERT(staging != nullptr);
 
 #ifdef _WIN32
@@ -420,7 +448,9 @@ void llama_moe_stream::worker_loop() {
     }
     lk.unlock();
 
-    moe_aligned_free(staging);
+    if (!staging_buf) {
+        moe_aligned_free(staging);
+    }
 }
 
 // least valuable evictable slot: empty first, then coldest resident (min route hotness, oldest use
