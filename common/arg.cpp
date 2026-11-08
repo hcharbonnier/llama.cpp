@@ -2804,10 +2804,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-stream-pin"}, "N",
         "max experts kept permanently resident per layer for --moe-stream, trading VRAM for fewer prefill waves "
-        "(0 = all spare slots); implies --moe-stream (default: 0)",
+        "(-1 = auto, half the cache dynamic; 0 = none; N > 0 = up to N, always leaving the wave minimum dynamic); "
+        "implies --moe-stream (default: -1)",
         [](common_params & params, int value) {
             params.moe_stream = true;
-            params.moe_stream_pin = (uint32_t) std::max(0, value);
+            if (value < -1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_stream_pin = value;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_PIN"));
     add_opt(common_arg(

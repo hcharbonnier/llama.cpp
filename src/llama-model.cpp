@@ -3708,7 +3708,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_slots            =*/ 0,
         /*.moe_stream_budget           =*/ 0,
         /*.moe_stream_ram              =*/ 0,
-        /*.moe_stream_pin              =*/ 0,
+        /*.moe_stream_pin              =*/ -1,
         /*.moe_stream_io_threads       =*/ 0,
         /*.moe_stream_direct           =*/ false,
         /*.vocab_only                  =*/ false,

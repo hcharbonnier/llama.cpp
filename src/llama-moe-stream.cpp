@@ -162,7 +162,7 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
 }
 
 // sizes the per-layer table and clamps the I/O thread count; workers are spawned lazily on first use
-llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint64_t ram_budget, uint32_t pin_max)
+llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint64_t ram_budget, int32_t pin_max)
         : n_slots(n_slots), ram_budget(ram_budget), pin_max(pin_max) {
     layers.resize(n_layer);
 
@@ -399,7 +399,7 @@ static std::vector<llama_files> llama_moe_stream_open_thread_files(const std::ve
 // the remap. A cache too small to spare slots for the pool leaves every slot dynamic.
 void llama_moe_stream::pin_partition(uint32_t n_expert_used) {
     // the dynamic pool must hold one wave plus its preload plus the parked pairs
-    const uint32_t n_dyn = std::max<uint32_t>(3*n_expert_used, 8);
+    const uint32_t n_dyn_min = std::max<uint32_t>(3*n_expert_used, 8);
 
     const int64_t t_start = ggml_time_us();
 
@@ -415,15 +415,22 @@ void llama_moe_stream::pin_partition(uint32_t n_expert_used) {
         }
         auto & sl = *sl_ptr;
 
+        // pin_max < 0: auto, half the cache stays dynamic
+        // pin_max == 0: nothing pinned
+        // pin_max > 0: at most pin_max pinned, never below n_dyn_min dynamic slots
+        uint32_t n_dyn = sl.n_slots;
+        if (pin_max < 0) {
+            n_dyn = std::max<uint32_t>(n_dyn_min, sl.n_slots - sl.n_slots/2);
+        } else if (pin_max > 0) {
+            n_dyn = std::max<uint32_t>(n_dyn_min, sl.n_slots - std::min<uint32_t>(sl.n_slots, (uint32_t) pin_max));
+        }
+
         if (sl.n_slots <= n_dyn) {
             sl.n_pinned = 0;
             continue;
         }
 
         sl.n_pinned = sl.n_slots - n_dyn;
-        if (pin_max > 0) {
-            sl.n_pinned = std::min(sl.n_pinned, pin_max);
-        }
         n_pinned    = std::max(n_pinned, sl.n_pinned);
         n_expert    = std::max(n_expert, sl.n_expert);
 
@@ -443,8 +450,12 @@ void llama_moe_stream::pin_partition(uint32_t n_expert_used) {
     this->n_pinned = n_pinned;
 
     if (jobs.empty()) {
-        LLAMA_LOG_INFO("%s: expert cache too small for a pinned partition (%u dynamic slots needed), all slots dynamic\n",
-                __func__, n_dyn);
+        if (pin_max == 0) {
+            LLAMA_LOG_INFO("%s: expert pinning disabled, all %u slots dynamic\n", __func__, n_slots);
+        } else {
+            LLAMA_LOG_INFO("%s: expert cache too small for a pinned partition (%u dynamic slots needed), all slots dynamic\n",
+                    __func__, n_dyn_min);
+        }
         return;
     }
 
