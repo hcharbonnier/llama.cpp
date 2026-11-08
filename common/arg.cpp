@@ -2793,12 +2793,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_CACHE"));
     add_opt(common_arg(
-        {"--moe-stream-ram"}, "N",
+        {"--moe-stream-ram"}, "N|auto",
         "host mirror for --moe-stream: pinned memory budget in GiB holding the experts the cache does not keep, "
-        "so their misses cross PCIe instead of reading the model file; implies --moe-stream (default: 0)",
-        [](common_params & params, int value) {
+        "so their misses cross PCIe instead of reading the model file, or 'auto' for half of the available physical RAM; "
+        "an explicit budget is used as requested; implies --moe-stream (default: 0)",
+        [](common_params & params, const std::string & value) {
             params.moe_stream = true;
-            params.moe_stream_ram = (uint64_t) std::max(0, value) * 1024ull * 1024ull * 1024ull;
+            if (value == "auto") {
+                params.moe_stream_ram_auto = true;
+                params.moe_stream_ram = 0;
+                return;
+            }
+            size_t pos = 0;
+            long long budget_gb = 0;
+            try {
+                budget_gb = std::stoll(value, &pos);
+            } catch (const std::exception &) {
+                throw std::invalid_argument("invalid value");
+            }
+            constexpr long long budget_gb_max = (long long) (UINT64_MAX / (1024ull * 1024ull * 1024ull));
+            if (budget_gb < 0 || budget_gb > budget_gb_max || pos != value.size()) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_stream_ram_auto = false;
+            params.moe_stream_ram = (uint64_t) budget_gb * 1024ull * 1024ull * 1024ull;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_RAM"));
     add_opt(common_arg(

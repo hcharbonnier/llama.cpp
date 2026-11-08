@@ -216,8 +216,8 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
 }
 
 // sizes the per-layer table and clamps the I/O thread count; workers are spawned lazily on first use
-llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint64_t ram_budget, int32_t pin_max)
-        : n_slots(n_slots), ram_budget(ram_budget), pin_max(pin_max) {
+llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint64_t ram_budget, int32_t pin_max, bool ram_auto)
+        : n_slots(n_slots), ram_budget(ram_budget), ram_auto(ram_auto), pin_max(pin_max) {
     layers.resize(n_layer);
 
     this->n_io_threads = n_io_threads <= 0 ? MOE_STREAM_IO_THREADS_DEFAULT : n_io_threads;
@@ -579,22 +579,27 @@ void llama_moe_stream::pin_partition(uint32_t n_expert_used) {
 // as a prefix: every layer gets the same share of the budget, and a layer whose share cannot hold
 // a whole expert keeps reading the file.
 void llama_moe_stream::fill_host_mirror() {
-    if (ram_budget == 0) {
+    if (ram_budget == 0 && !ram_auto) {
         return;
     }
 
     const uint64_t ram_free = llama_moe_stream_phys_free();
-    if (ram_free > 0) {
-        const uint64_t ram_cap = ram_free * MOE_STREAM_RAM_FREE_PERCENT / 100;
-        if (ram_budget > ram_cap) {
-            LLAMA_LOG_WARN("%s: reducing host mirror budget from %.2f GiB to %.2f GiB (%" PRIu64 "%% of available physical RAM)\n",
-                    __func__, ram_budget / 1024.0 / 1024.0 / 1024.0, ram_cap / 1024.0 / 1024.0 / 1024.0,
-                    MOE_STREAM_RAM_FREE_PERCENT);
-            ram_budget = (size_t) ram_cap;
+    const uint64_t ram_cap  = ram_free > 0 ? ram_free * MOE_STREAM_RAM_FREE_PERCENT / 100 : 0;
+
+    if (ram_auto) {
+        if (ram_cap == 0) {
+            LLAMA_LOG_WARN("%s: cannot read available physical RAM, host mirror disabled\n", __func__);
+            return;
         }
+        ram_budget = (size_t) ram_cap;
+        LLAMA_LOG_INFO("%s: host mirror budget = %.2f GiB (%" PRIu64 "%% of available physical RAM)\n",
+                __func__, ram_budget / 1024.0 / 1024.0 / 1024.0, MOE_STREAM_RAM_FREE_PERCENT);
+    } else if (ram_cap > 0 && ram_budget > ram_cap) {
+        LLAMA_LOG_INFO("%s: host mirror budget %.2f GiB exceeds %" PRIu64 "%% of available physical RAM (%.2f GiB), using it as requested\n",
+                __func__, ram_budget / 1024.0 / 1024.0 / 1024.0, MOE_STREAM_RAM_FREE_PERCENT,
+                ram_cap / 1024.0 / 1024.0 / 1024.0);
     }
     if (ram_budget == 0) {
-        LLAMA_LOG_WARN("%s: host mirror budget reduced to zero, host mirror disabled\n", __func__);
         return;
     }
 

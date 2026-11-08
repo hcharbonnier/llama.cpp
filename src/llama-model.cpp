@@ -1898,7 +1898,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (pimpl->has_tensor_overrides) {
                 LLAMA_LOG_WARN("%s: tensor buffer overrides (-ot/--cpu-moe) do not apply to SSD-streamed expert tensors\n", __func__);
             }
-            pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream_io_threads, params.moe_stream_direct, params.moe_stream_ram, params.moe_stream_pin);
+            pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream_io_threads, params.moe_stream_direct, params.moe_stream_ram, params.moe_stream_pin, params.moe_stream_ram_auto);
             LLAMA_LOG_INFO("%s: MoE expert SSD streaming enabled, %u of %u experts cached per layer, %d I/O threads\n",
                     __func__, n_slots, hparams.n_expert, pimpl->moe_stream->n_io_threads);
         }
@@ -3718,6 +3718,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_pin              =*/ -1,
         /*.moe_stream_io_threads       =*/ 0,
         /*.moe_stream_direct           =*/ false,
+        /*.moe_stream_ram_auto         =*/ false,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
