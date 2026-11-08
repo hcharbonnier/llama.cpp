@@ -197,6 +197,8 @@ struct llama_moe_stream {
         int64_t n_hit       = 0; // touched experts already resident or loading
         int64_t n_miss      = 0; // demand loads issued
         int64_t n_miss_cold = 0; // first-ever touch of an expert
+        int64_t n_load_ram  = 0; // expert loads served by the pinned host mirror
+        int64_t n_load_disk = 0; // expert loads read from the model file
         int64_t t_stall_us  = 0; // wait time in miss handling
 
         int64_t n_wave_calls     = 0; // wave-ids invocations (>= n_calls under multi-pass prefill)

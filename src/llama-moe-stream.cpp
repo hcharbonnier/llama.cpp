@@ -742,12 +742,14 @@ void llama_moe_stream::worker_loop() {
         lk.unlock();
 
         bool ok = true;
+        bool from_ram = true;
         for (const auto & wt : sl.weights) {
             const uint8_t * data = nullptr;
             if (wt.host != nullptr && (uint32_t) w.expert >= wt.host_first) {
                 // pinned host mirror: the miss is a PCIe copy, not a file read
                 data = wt.host + (size_t) (w.expert - wt.host_first)*wt.nb_expert;
             } else {
+                from_ram = false;
 #ifdef _WIN32
                 llama_file & wf = *worker_files[wt.file_idx];
 #else
@@ -769,6 +771,11 @@ void llama_moe_stream::worker_loop() {
             load_failed = true;
         } else {
             sl.slot_state[w.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
+            if (from_ram) {
+                stats.n_load_ram++;
+            } else {
+                stats.n_load_disk++;
+            }
         }
         cv_done.notify_all();
     }
@@ -840,6 +847,8 @@ void llama_moe_stream::print_stats() const {
             n_touched > 0 ? 100.0*stats.n_hit/n_touched : 0.0);
     LLAMA_LOG_INFO("%s: moe stream: load stall = %.2f ms total (%.3f ms per remap call)\n",
             __func__, stats.t_stall_us/1000.0, stats.n_calls > 0 ? stats.t_stall_us/1000.0/stats.n_calls : 0.0);
+    LLAMA_LOG_INFO("%s: moe stream: expert loads = %" PRId64 " (ram = %" PRId64 ", disk = %" PRId64 ")\n",
+            __func__, stats.n_load_ram + stats.n_load_disk, stats.n_load_ram, stats.n_load_disk);
     if (stats.n_wave_calls > 0) {
         LLAMA_LOG_INFO("%s: moe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
                 __func__, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0);
