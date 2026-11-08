@@ -277,6 +277,7 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
     // hoisted per-graph MSA state (shared by every sparse layer)
     llm_graph_input_msa * msa = nullptr;
     ggml_tensor * msa_kqm = nullptr;
+    ggml_tensor * msa_mf  = nullptr;   // F32 copy of the FA mask, shared by the batch layers
     int64_t n_kv = 0, n_ps = 0, nblk = 0, ns = 1, n_tps = 0;
     bool msa_decode = false;           // gather (1 token per stream) vs mask
     const int     blk = mm.msa_p.blk;
@@ -314,6 +315,8 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
         } else {
             inp->cell_blk = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, ns);
             ggml_set_input(inp->cell_blk);
+
+            msa_mf = ggml_cast(ctx0, msa_kqm, GGML_TYPE_F32);
         }
 
         msa = (llm_graph_input_msa *) res->add_input(std::move(inp));
@@ -493,8 +496,8 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
                                 iq->nb[1], iq->nb[2], t0*iq->nb[2]);
                         ggml_tensor * pm_s = ggml_view_3d(ctx0, msa->pos_mask, n_ps, 1, nt,
                                 msa->pos_mask->nb[1], msa->pos_mask->nb[1], t0*msa->pos_mask->nb[1]);
-                        ggml_tensor * mf_s = ggml_cast(ctx0, ggml_view_3d(ctx0, msa_kqm, n_kv, nt, 1,
-                                msa_kqm->nb[1], msa_kqm->nb[3], st*msa_kqm->nb[3] + c0*msa_kqm->nb[1]), GGML_TYPE_F32);
+                        ggml_tensor * mf_s = ggml_view_3d(ctx0, msa_mf, n_kv, nt, 1,
+                                msa_mf->nb[1], msa_mf->nb[3], st*msa_mf->nb[3] + c0*msa_mf->nb[1]);
                         ggml_tensor * bias_s = ggml_view_3d(ctx0, msa->bias, nblk, 1, nt,
                                 msa->bias->nb[1], msa->bias->nb[1], t0*msa->bias->nb[1]);
                         ggml_tensor * q_s = ggml_view_3d(ctx0, Qcur, D, n_head, nt,
@@ -547,9 +550,18 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
                         outs.push_back(build_attn_msa_fa(q_s, kfa, vfa, mask4, Gp, kq_scale, il));
                     }
                     }
-                    cur = outs[0];
-                    for (size_t i = 1; i < outs.size(); ++i) {
-                        cur = ggml_concat(ctx0, cur, outs[i], 1);
+                    if (outs.size() == 1) {
+                        cur = outs[0];
+                    } else {
+                        // write each chunk once into the full output instead of chaining concats
+                        cur = ggml_new_tensor_2d(ctx0, outs[0]->type, outs[0]->ne[0], n_tokens);
+                        int64_t off = 0;
+                        for (ggml_tensor * o : outs) {
+                            ggml_build_forward_expand(gf, ggml_cpy(ctx0, o,
+                                    ggml_view_2d(ctx0, cur, o->ne[0], o->ne[1], cur->nb[1], off*cur->nb[1])));
+                            off += o->ne[1];
+                        }
+                        GGML_ASSERT(off == n_tokens);
                     }
                 }
                 if (inp_attn->self_v_rot[il]) {
