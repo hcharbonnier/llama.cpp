@@ -1759,7 +1759,7 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
         if (cache_from_params) {
             // an explicit --moe-stream-cache is a hard budget: fail at load instead of hitting
             // the graph-build abort on the first batch that needs multi-pass prefill
-            throw std::runtime_error(format("%s: --moe-stream-cache gives %u slots per layer, but multi-pass prefill needs at least %u (2*n_expert_used); increase --moe-stream-cache or reduce -ub",
+            throw std::runtime_error(format("%s: --moe-stream-cache gives %u slots per layer, but multi-pass prefill needs at least %u (2*n_expert_used); increase --moe-stream-cache",
                     __func__, n_slots, n_slots_min));
         }
         LLAMA_LOG_WARN("%s: raising MoE expert cache from %u to %u slots (2*n_expert_used)\n",

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -34,7 +35,7 @@ static const uint32_t MOE_STREAM_IO_THREADS_DEFAULT = 16;
 static const uint32_t MOE_STREAM_IO_THREADS_MAX     = 32;
 static const int64_t  MOE_STREAM_HOT_DECAY_TOKENS   = 64;
 static const size_t   MOE_STREAM_STAGING_MAX        = 1ull*1024*1024*1024; // cap on the total staging of the I/O workers
-static const uint64_t MOE_STREAM_RAM_FREE_PERCENT   = 50; // host mirror budget cap, in percent of free physical RAM
+static const uint64_t MOE_STREAM_RAM_FREE_PERCENT   = 50; // host mirror budget cap, in percent of available physical RAM
 
 // O_DIRECT alignment: 4096 is a multiple of any device logical block size (512/4096), so it is
 // universally valid, and reading a few extra KB of head/tail padding per slab is negligible
@@ -73,7 +74,7 @@ static void moe_aligned_free(void * p) {
 #endif
 }
 
-// free physical RAM, 0 when unknown
+// available physical RAM, 0 when unknown
 static uint64_t llama_moe_stream_phys_free() {
 #ifdef _WIN32
     MEMORYSTATUSEX status;
@@ -90,6 +91,21 @@ static uint64_t llama_moe_stream_phys_free() {
     }
     return ((uint64_t) vm_stat.free_count + vm_stat.inactive_count) * (uint64_t) vm_page_size;
 #else
+    // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES (MemFree)
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f != nullptr) {
+        char line[256];
+        uint64_t avail_kb = 0;
+        while (fgets(line, sizeof(line), f) != nullptr) {
+            if (sscanf(line, "MemAvailable: %" SCNu64 " kB", &avail_kb) == 1) {
+                break;
+            }
+        }
+        fclose(f);
+        if (avail_kb > 0) {
+            return avail_kb * 1024;
+        }
+    }
     const long pages     = sysconf(_SC_AVPHYS_PAGES);
     const long page_size = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || page_size <= 0) {
@@ -568,7 +584,7 @@ void llama_moe_stream::fill_host_mirror() {
     if (ram_free > 0) {
         const uint64_t ram_cap = ram_free * MOE_STREAM_RAM_FREE_PERCENT / 100;
         if (ram_budget > ram_cap) {
-            LLAMA_LOG_WARN("%s: reducing host mirror budget from %.2f GiB to %.2f GiB (%" PRIu64 "%% of free physical RAM)\n",
+            LLAMA_LOG_WARN("%s: reducing host mirror budget from %.2f GiB to %.2f GiB (%" PRIu64 "%% of available physical RAM)\n",
                     __func__, ram_budget / 1024.0 / 1024.0 / 1024.0, ram_cap / 1024.0 / 1024.0 / 1024.0,
                     MOE_STREAM_RAM_FREE_PERCENT);
             ram_budget = (size_t) ram_cap;
