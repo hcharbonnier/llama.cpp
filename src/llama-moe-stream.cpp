@@ -306,6 +306,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
 }
 
 void llama_moe_stream::alloc_bufs(bool no_alloc) {
+    this->no_alloc = no_alloc;
     for (auto & [buft, ctx_ptr] : ctxs) {
         ggml_context * ctx = ctx_ptr.get();
         if (ggml_get_first_tensor(ctx) == nullptr) {
@@ -327,8 +328,10 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         bufs.emplace_back(buf);
 
+        // the dummy buffer has size 0, report the size the cache tensors would need
+        const size_t size = no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft) : ggml_backend_buffer_get_size(buf);
         LLAMA_LOG_INFO("%s: %12s expert cache size = %8.2f MiB (%u slots per layer)\n",
-                __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0, n_slots);
+                __func__, ggml_backend_buffer_name(buf), size / 1024.0 / 1024.0, n_slots);
     }
 }
 
@@ -951,6 +954,20 @@ size_t llama_moe_stream::size_bufs() const {
         size += ggml_backend_buffer_get_size(buf.get());
     }
     return size;
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_moe_stream::memory_breakdown() const {
+    std::map<ggml_backend_buffer_type_t, size_t> res;
+    if (no_alloc) {
+        for (const auto & [buft, ctx_ptr] : ctxs) {
+            res[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx_ptr.get(), buft);
+        }
+    } else {
+        for (const auto & buf : bufs) {
+            res[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+        }
+    }
+    return res;
 }
 
 void llama_moe_stream::print_stats() const {

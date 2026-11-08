@@ -64,6 +64,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl_skip,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
+        bool & hp_moe_stream,
         ggml_log_level log_level) {
     common_fit_log_scope log_scope(log_level);
 
@@ -157,6 +158,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     hp_ngl_skip    = mparams->load_mtp ? 0 : llama_model_n_layer_nextn(model);
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
+    hp_moe_stream  = llama_model_moe_stream_enabled(model);
 
     common_memory_breakdown_print(ctx);
 
@@ -247,8 +249,9 @@ common_device_memory_data_vec common_get_device_memory_data(
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
         ggml_log_level log_level) {
+    bool moe_stream = false;
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_ngl_skip, hp_n_ctx_train, hp_n_expert, log_level);
+            path_model, mparams, cparams, devs, hp_ngl, hp_ngl_skip, hp_n_ctx_train, hp_n_expert, moe_stream, log_level);
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {
@@ -277,6 +280,7 @@ static void common_params_fit_impl(
     uint32_t hp_nsk = 0; // number of skipped NextN layers, counted by the model loader but not by hp_ngl
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
+    bool     hp_moe_stream = false; // MoE expert streaming is active, the expert cache is counted
 
     // with non-unified kv, we need to take into account n_streams
     // for example, if memory can hold more than model's trained context size, we must extend the n_ctx to hold enough n_streams
@@ -299,6 +303,7 @@ static void common_params_fit_impl(
             uint32_t nsk_extra = 0;
             uint32_t nct_extra = 0;
             uint32_t nex_extra = 0;
+            bool     moe_extra = false;
 
             extra->cparams->n_ctx = cparams->n_ctx;
 
@@ -308,7 +313,7 @@ static void common_params_fit_impl(
             dmds_t measured;
             try {
                 measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, moe_extra, log_level);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
@@ -348,7 +353,7 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, hp_moe_stream, log_level);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -360,7 +365,7 @@ static void common_params_fit_impl(
         if (n_streams > 1) {
             LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                 __func__, n_ctx_max, n_streams);
-            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
+            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, hp_moe_stream, log_level);
         }
     }
     add_extra_memory(dmds_full);
@@ -499,7 +504,7 @@ static void common_params_fit_impl(
 
                     int64_t sum_projected_used_min_ctx = 0;
                     cparams->n_ctx = n_ctx_min_total;
-                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
+                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, hp_moe_stream, log_level);
                     add_extra_memory(dmds_min_ctx);
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
@@ -547,9 +552,23 @@ static void common_params_fit_impl(
         throw common_params_fit_exception("was unable to fit model into system memory by reducing context, abort");
     }
 
-    if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
-        throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
+    // the expert cache size depends on the layer split, so an explicit n_gpu_layers cannot reserve room for it; on a single device let fit lower it when the cache does not fit
+    const bool fit_ngl_moe_stream = hp_moe_stream && nd == 1;
+    if (mparams->n_gpu_layers != default_mparams.n_gpu_layers && !fit_ngl_moe_stream) {
+        std::string msg = "n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort";
+        if (hp_moe_stream) {
+            msg += " (the streamed expert cache is included in the memory measurement, set n_gpu_layers lower)";
+        }
+        throw common_params_fit_exception(msg);
     }
+    const int32_t user_ngl = mparams->n_gpu_layers;
+    const char * func_fit = __func__;
+    auto log_ngl_moe_stream = [&]() {
+        if (fit_ngl_moe_stream && user_ngl != default_mparams.n_gpu_layers && mparams->n_gpu_layers != user_ngl) {
+            LOG_WRN("%s: MoE expert streaming: adjusted n_gpu_layers from %" PRId32 " to %" PRId32 " to leave room for the expert cache\n",
+                    func_fit, user_ngl, mparams->n_gpu_layers);
+        }
+    };
     if (nd > 1) {
         if (!tensor_split) {
             throw common_params_fit_exception("did not provide a buffer to write the tensor_split to, abort");
@@ -695,7 +714,7 @@ static void common_params_fit_impl(
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
         dmds_t dmd_nl = common_get_device_memory_data_impl(
-            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
+            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, hp_moe_stream, log_level);
         add_extra_memory(dmd_nl);
 
         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
@@ -724,7 +743,7 @@ static void common_params_fit_impl(
 
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
         dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, log_level);
+            path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, hp_moe_stream, log_level);
         add_extra_memory(dmds_cpu_moe);
 
         for (size_t id = 0; id < nd; id++) {
@@ -830,6 +849,7 @@ static void common_params_fit_impl(
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+        log_ngl_moe_stream();
         return;
     }
 
@@ -975,6 +995,7 @@ static void common_params_fit_impl(
     }
 
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+    log_ngl_moe_stream();
 }
 
 enum common_params_fit_status common_fit_params(
@@ -1208,8 +1229,9 @@ void common_fit_print(
     uint32_t hp_nsk = 0; // number of skipped NextN layers, counted by the model loader but not by hp_ngl
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
+    bool     moe_stream = false;
 
-    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nsk, hp_nct, hp_nex, moe_stream, GGML_LOG_LEVEL_ERROR);
     GGML_ASSERT(dmd.size() == devs.size() + 1);
 
     for (size_t id = 0; id < devs.size(); id++) {
