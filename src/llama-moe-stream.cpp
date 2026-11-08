@@ -897,18 +897,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     }
 
     // route hotness for eviction; halved periodically so a formerly-hot expert ages out
-    for (const int32_t e : sl->uniq) {
-        sat_inc(sl->route_hotness[e]);
-    }
-    if (mgr->hot_decay_interval > 0 && mgr->stats.n_calls % mgr->hot_decay_interval == 0) {
-        for (auto & sl2 : mgr->layers) {
-            if (sl2) {
-                for (auto & h : sl2->route_hotness) {
-                    h >>= 1;
-                }
-            }
-        }
-    }
+    mgr->update_hotness_locked(*sl);
 
     // classify the touched experts; reserve and enqueue demand loads in deterministic order
     std::fill(sl->keep.begin(), sl->keep.end(), 0);
@@ -988,6 +977,23 @@ llama_moe_stream_wave * llama_moe_stream_layer::wave_userdata(int32_t wave, uint
     return wave_ud[wave].get();
 }
 
+// bump the route hotness of the touched experts (sl.uniq) and halve every counter periodically so
+// a formerly-hot expert ages out; shared by the decode remap and the prefill wave planner
+void llama_moe_stream::update_hotness_locked(llama_moe_stream_layer & sl) {
+    for (const int32_t e : sl.uniq) {
+        sat_inc(sl.route_hotness[e]);
+    }
+    if (hot_decay_interval > 0 && stats.n_calls % hot_decay_interval == 0) {
+        for (auto & sl2 : layers) {
+            if (sl2) {
+                for (auto & h : sl2->route_hotness) {
+                    h >>= 1;
+                }
+            }
+        }
+    }
+}
+
 // wave 0 of a ubatch: record the distinct touched experts (sl.uniq, first-use order) and split them
 // into consecutive groups of plan_capacity, one group per wave (sl.expert_wave[e] = e's wave)
 void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n) {
@@ -1010,6 +1016,8 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
             sl.uniq.push_back(e);
         }
     }
+
+    update_hotness_locked(sl);
 
     GGML_ASSERT(sl.plan_capacity > 0);
     for (size_t i = 0; i < sl.uniq.size(); i++) {

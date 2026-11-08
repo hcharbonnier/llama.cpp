@@ -173,7 +173,7 @@ struct llama_moe_stream {
     std::vector<ggml_backend_buffer_ptr> host_bufs;
 
     size_t  max_nb_expert      = 0;
-    int64_t hot_decay_interval = 0; // remap calls between route-hotness halvings (0 = no decay)
+    int64_t hot_decay_interval = 0; // stream calls (remap + wave plans) between route-hotness halvings (0 = no decay)
 
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context_ptr>> ctxs; // one per buft
     std::vector<ggml_backend_buffer_ptr> bufs;
@@ -193,7 +193,7 @@ struct llama_moe_stream {
     bool debug = false;
 
     struct {
-        int64_t n_calls     = 0; // remap invocations
+        int64_t n_calls     = 0; // stream calls (remap + wave plans)
         int64_t n_hit       = 0; // touched experts already resident or loading
         int64_t n_miss      = 0; // demand loads issued
         int64_t n_miss_cold = 0; // first-ever touch of an expert
@@ -211,6 +211,7 @@ struct llama_moe_stream {
     void worker_loop();
     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
+    void update_hotness_locked(llama_moe_stream_layer & sl); // bump touched experts, decay periodically
 
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
     void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
