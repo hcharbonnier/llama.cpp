@@ -312,8 +312,10 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         bufs.emplace_back(buf);
 
+        // the dummy buffer has size 0, report the size the cache tensors would need
+        const size_t size = no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft) : ggml_backend_buffer_get_size(buf);
         LLAMA_LOG_INFO("%s: %12s expert cache size = %8.2f MiB (%u slots per layer)\n",
-                __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0, n_slots);
+                __func__, ggml_backend_buffer_name(buf), size / 1024.0 / 1024.0, n_slots);
     }
 }
 
