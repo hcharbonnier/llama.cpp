@@ -98,8 +98,6 @@ struct llama_moe_stream_layer {
     uint32_t plan_n_waves   = 0;  // waves of the current call
     int32_t  plan_next_wave = -1; // wave expected to run next (ordering guard)
     std::vector<uint8_t> expert_wave; // [n_expert] wave each touched expert belongs to, 0xff = untouched
-    std::vector<int32_t> plan_pool;   // resident slots the masked-out pairs of this wave park on
-    std::vector<int32_t> pool_used;   // scratch: pool slots already used in the current token row
 
     std::vector<std::unique_ptr<llama_moe_stream_wave>> wave_ud; // stable per-wave op userdata
 
@@ -216,7 +214,7 @@ struct llama_moe_stream {
 
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
     void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
-    void stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w, uint32_t n_ids); // make wave w resident + preload next
+    void stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w); // make wave w resident + preload next
     void emit_wave_slots(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out, int32_t w, uint32_t n_ids, int64_t n_tok); // write the slot ids
 };
 
@@ -225,7 +223,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
 
 // callbacks of the multi-pass prefill custom ops inserted by build_moe_ffn when a ubatch touches
 // more experts than the cache holds; each src[0] is the contiguous selected ids
-//   wave_ids:  makes wave w's expert slice resident and emits slot ids (masked pairs park on a pool)
+//   wave_ids:  makes wave w's expert slice resident and emits slot ids (-1 for other waves)
 //   wave_mask: emits 1.0 for pairs belonging to wave w, 0.0 otherwise
 void llama_moe_stream_wave_ids (ggml_tensor * dst, int ith, int nth, void * userdata);
 void llama_moe_stream_wave_mask(ggml_tensor * dst, int ith, int nth, void * userdata);
