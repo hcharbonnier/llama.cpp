@@ -790,22 +790,32 @@ void llama_moe_stream::worker_loop() {
         GGML_UNUSED(ctx);
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
         ggml_backend_buffer_type_t host_buft = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
-        if (host_buft == nullptr) {
+        if (host_buft == nullptr || !ggml_backend_buft_is_host(host_buft)) {
             continue;
         }
         ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(host_buft, staging_size);
         if (buf == nullptr) {
             continue;
         }
+        uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf);
+        if (base == nullptr) {
+            ggml_backend_buffer_free(buf);
+            continue;
+        }
+        // O_DIRECT requires a 4096-aligned buffer; pinned allocations only guarantee 256 bytes
+        base = (uint8_t *) (((uintptr_t) base + MOE_STREAM_DIRECT_ALIGN - 1) & ~(uintptr_t)(MOE_STREAM_DIRECT_ALIGN - 1));
+        if (use_direct_io && !files.empty() &&
+                llama_moe_stream_pread(*files.front(), base, MOE_STREAM_DIRECT_ALIGN, 0, /*direct =*/ true) == nullptr) {
+            // device-mapped host memory (e.g. Vulkan) rejects O_DIRECT reads into it
+            ggml_backend_buffer_free(buf);
+            continue;
+        }
         staging_buf.reset(buf);
-        staging = (uint8_t *) ggml_backend_buffer_get_base(buf);
+        staging = base;
         break;
     }
     if (staging == nullptr) {
         staging = (uint8_t *) moe_aligned_alloc(staging_size);
-    } else {
-        // O_DIRECT requires a 4096-aligned buffer; pinned allocations only guarantee 256 bytes
-        staging = (uint8_t *) (((uintptr_t) staging + MOE_STREAM_DIRECT_ALIGN - 1) & ~(uintptr_t)(MOE_STREAM_DIRECT_ALIGN - 1));
     }
     GGML_ASSERT(staging != nullptr);
 
