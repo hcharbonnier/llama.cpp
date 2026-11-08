@@ -2672,13 +2672,14 @@ cur = build_lora_mm_id(gate_exps, cur, ids_gemm, gate_exps_s, slots, selected_ex
 
             ggml_tensor * e_w = build_expert_gemms(cur, ids_w);
 
-            ggml_tensor * margs[2] = { ids_cont, ids_w };
-            ggml_tensor * mask_w = ggml_custom_4d(ctx0, GGML_TYPE_F32,
-                    1, n_expert_used, n_tokens, 1,
-                    margs, 2, llama_moe_stream_wave_mask, 1, msl->wave_userdata(w, stream_wave_cap));
+            // ids_w holds slot ids and -1 for the other waves; step(id + 0.5) keeps this wave, drops -1
+            ggml_tensor * mask_w = ggml_cast(ctx0, ids_w, GGML_TYPE_F32);
+            mask_w = ggml_scale_bias(ctx0, mask_w, 1.0f, 0.5f);
+            mask_w = ggml_step(ctx0, mask_w);
+            mask_w = ggml_reshape_3d(ctx0, mask_w, 1, n_expert_used, n_tokens);
             cb(mask_w, "ffn_moe_wave_mask", il);
 
-            e_w = ggml_mul(ctx0, e_w, mask_w); // zero the pairs that belong to other waves
+            e_w = ggml_mul(ctx0, e_w, mask_w);
 
             experts = experts == nullptr ? e_w : ggml_add(ctx0, experts, e_w);
             ggml_build_forward_expand(gf, experts);
