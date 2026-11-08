@@ -123,9 +123,15 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
 static __device__ __forceinline__ float ggml_cuda_e4m3_to_fp32(const uint8_t x) {
     const int exp = (x >> 3) & 0xF;
     const int man = x & 0x7;
-    float v = exp == 0 ? ldexpf((float) man, -9) : ldexpf((float) (8 + man), exp - 10);
-    v = (exp == 0xF && man == 0x7) ? __int_as_float(0x7FC00000) : v;
-    return (x & 0x80) ? -v : v;
+    if (exp == 0xF && man == 0x7) {
+        return (x & 0x80) ? __int_as_float((int) 0xFFC00000u) : __int_as_float(0x7FC00000);
+    }
+    if (exp == 0) {
+        const float v = (float) man * (1.0f/512.0f);
+        return (x & 0x80) ? -v : v;
+    }
+    const uint32_t bits = ((uint32_t)(x & 0x80) << 24) | ((uint32_t)(exp - 7 + 127) << 23) | ((uint32_t) man << 20);
+    return __int_as_float((int) bits);
 }
 
 static __device__ __forceinline__ void dequantize_mxfp8(const void * vx, const int64_t ib, const int iqs, float2 & v) {
