@@ -226,9 +226,6 @@ struct llama_moe_stream {
 // callback of the id-remapping custom op inserted by build_moe_ffn
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
 
-// callbacks of the multi-pass prefill custom ops inserted by build_moe_ffn when a ubatch touches
-// more experts than the cache holds; each src[0] is the contiguous selected ids
-//   wave_ids:  makes wave w's expert slice resident and emits slot ids (-1 for other waves)
-//   wave_mask: emits 1.0 for pairs belonging to wave w, 0.0 otherwise
-void llama_moe_stream_wave_ids (ggml_tensor * dst, int ith, int nth, void * userdata);
-void llama_moe_stream_wave_mask(ggml_tensor * dst, int ith, int nth, void * userdata);
+// callback of the multi-pass prefill custom op inserted by build_moe_ffn when a ubatch touches
+//   more experts than the cache holds; makes wave w resident and emits slot ids (-1 for other waves)
+void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userdata);

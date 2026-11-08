@@ -1300,36 +1300,3 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
 
     mgr->emit_wave_slots(*sl, ids, out, w, n_ids, a->ne[1]);
 }
-
-// multi-pass prefill: 1.0 for pairs whose expert belongs to wave w, 0.0 otherwise; multiplied into
-// this wave's expert GEMM output so the pairs of other waves contribute nothing to the sum
-void llama_moe_stream_wave_mask(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    GGML_UNUSED(nth);
-    if (ith != 0) {
-        return;
-    }
-
-    auto * ud  = (llama_moe_stream_wave *) userdata;
-    auto * sl  = ud->sl;
-    auto * mgr = sl->mgr;
-
-    const int32_t w = ud->wave;
-
-    const ggml_tensor * a = dst->src[0]; // contiguous selected ids
-    GGML_ASSERT(a->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_contiguous(a));
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(a));
-
-    const int64_t   n   = ggml_nelements(a);
-    const int32_t * ids = (const int32_t *) a->data;
-          float   * out = (float *) dst->data;
-
-    std::lock_guard<std::mutex> lock(mgr->mtx);
-
-    GGML_ASSERT(sl->plan_next_wave > w); // this wave's ids op has already run
-
-    for (int64_t i = 0; i < n; i++) {
-        out[i] = sl->expert_wave[ids[i]] == (uint8_t) w ? 1.0f : 0.0f;
-    }
-}
