@@ -22,11 +22,19 @@
 #else
 #include <fcntl.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#include <mach/vm_param.h>
+#include <mach/vm_statistics.h>
+#endif
 #endif
 
 static const uint32_t MOE_STREAM_IO_THREADS_DEFAULT = 9;
 static const uint32_t MOE_STREAM_IO_THREADS_MAX     = 32;
 static const int64_t  MOE_STREAM_HOT_DECAY_TOKENS   = 64;
+static const size_t   MOE_STREAM_STAGING_MAX        = 1ull*1024*1024*1024; // cap on the total staging of the I/O workers
+static const uint64_t MOE_STREAM_RAM_FREE_PERCENT   = 50; // host mirror budget cap, in percent of free physical RAM
 
 // O_DIRECT alignment: 4096 is a multiple of any device logical block size (512/4096), so it is
 // universally valid, and reading a few extra KB of head/tail padding per slab is negligible
@@ -63,6 +71,36 @@ static void moe_aligned_free(void * p) {
 #else
     free(p);
 #endif
+}
+
+// free physical RAM, 0 when unknown
+static uint64_t llama_moe_stream_phys_free() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status)) {
+        return 0;
+    }
+    return status.ullAvailPhys;
+#elif defined(__APPLE__)
+    vm_statistics64_data_t vm_stat;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm_stat, &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    return ((uint64_t) vm_stat.free_count + vm_stat.inactive_count) * (uint64_t) vm_page_size;
+#else
+    const long pages     = sysconf(_SC_AVPHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page_size <= 0) {
+        return 0;
+    }
+    return (uint64_t) pages * (uint64_t) page_size;
+#endif
+}
+
+static size_t moe_stream_staging_size(size_t max_nb_expert) {
+    return max_nb_expert + 4*MOE_STREAM_DIRECT_ALIGN;
 }
 
 // read len bytes at file offset offs into staging (thread-safe positional read); staging must have
@@ -275,6 +313,18 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
 
         LLAMA_LOG_INFO("%s: %12s expert cache size = %8.2f MiB (%u slots per layer)\n",
                 __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0, n_slots);
+    }
+}
+
+void llama_moe_stream::clamp_io_staging() {
+    const size_t staging_size = moe_stream_staging_size(max_nb_expert);
+    const int32_t max_threads = (int32_t) std::max<size_t>(MOE_STREAM_STAGING_MAX / staging_size, 1);
+    if (n_io_threads > max_threads) {
+        LLAMA_LOG_WARN("%s: reducing MoE I/O threads from %d to %d (staging %.2f MiB per worker, %.2f MiB total, cap %.2f MiB)\n",
+                __func__, n_io_threads, max_threads, staging_size / 1024.0 / 1024.0,
+                staging_size * (size_t) max_threads / 1024.0 / 1024.0,
+                MOE_STREAM_STAGING_MAX / 1024.0 / 1024.0);
+        n_io_threads = max_threads;
     }
 }
 
@@ -508,6 +558,21 @@ void llama_moe_stream::fill_host_mirror() {
         return;
     }
 
+    const uint64_t ram_free = llama_moe_stream_phys_free();
+    if (ram_free > 0) {
+        const uint64_t ram_cap = ram_free * MOE_STREAM_RAM_FREE_PERCENT / 100;
+        if (ram_budget > ram_cap) {
+            LLAMA_LOG_WARN("%s: reducing host mirror budget from %.2f GiB to %.2f GiB (%" PRIu64 "%% of free physical RAM)\n",
+                    __func__, ram_budget / 1024.0 / 1024.0 / 1024.0, ram_cap / 1024.0 / 1024.0 / 1024.0,
+                    MOE_STREAM_RAM_FREE_PERCENT);
+            ram_budget = (size_t) ram_cap;
+        }
+    }
+    if (ram_budget == 0) {
+        LLAMA_LOG_WARN("%s: host mirror budget reduced to zero, host mirror disabled\n", __func__);
+        return;
+    }
+
     const int64_t t_start = ggml_time_us();
 
     struct job { llama_moe_stream_weight * wt; uint32_t first; uint32_t last; uint8_t * dst; };
@@ -680,7 +745,7 @@ void llama_moe_stream::worker_loop() {
     //   (Metal private buffers; O_DIRECT needs the extra head/tail slack for its aligned reads)
     ggml_backend_buffer_ptr staging_buf;
     uint8_t * staging = nullptr;
-    const size_t staging_size = max_nb_expert + 4*MOE_STREAM_DIRECT_ALIGN;
+    const size_t staging_size = moe_stream_staging_size(max_nb_expert);
 
     for (const auto & [buft, ctx] : ctxs) {
         GGML_UNUSED(ctx);
