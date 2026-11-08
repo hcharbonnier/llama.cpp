@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "common.cuh"
+#include "mmid.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
 #include "mmf.cuh"
@@ -38,6 +39,10 @@ static __global__ void mul_mat_vec_f(
         channel_x  = ids ? ids[blockIdx.y + token_idx * ids_stride]            : fastdiv((uint32_t) channel_dst, channel_ratio);
         channel_y  = ids ? fastmodulo(blockIdx.y, nchannels_y)                 : channel_dst;
         sample_dst = ids ? 0                                                   : blockIdx.z;
+    }
+
+    if (ids != nullptr && (int32_t) channel_x < 0) {
+        return; // skipped slot, zeroed with the other skipped rows
     }
 
     const int sample_x    = fastdiv((uint32_t) sample_dst, sample_ratio);
@@ -649,6 +654,15 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     GGML_ASSERT(        nb10       == ts_src1);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
     GGML_ASSERT(        nb0        == ts_dst);
+
+    if (ids) {
+        // no GEMM path writes the rows of skipped slots (negative ids), zero them up front
+        ggml_cuda_zero_skipped_mul_mat_id((const int32_t *) ids->data, (float *) dst->data,
+            dst->ne[0], ids->ne[1], ids->ne[0],
+            ids->nb[0]/ggml_element_size(ids), ids->nb[1]/ggml_element_size(ids),
+            dst->nb[1], dst->nb[2], ctx.stream());
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst->op_params[0]) : GGML_PREC_F32;

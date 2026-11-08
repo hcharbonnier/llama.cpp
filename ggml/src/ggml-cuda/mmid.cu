@@ -53,7 +53,8 @@ static __global__ void mm_ids_helper(
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
+                // a negative id is a skipped slot, it belongs to no expert
+                nex_prev += expert_used >= 0 && expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
@@ -79,7 +80,7 @@ static __global__ void mm_ids_helper(
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            nex_prev += expert_used >= 0 && expert_used < expert;
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -202,4 +203,46 @@ void ggml_cuda_launch_mm_ids_helper(
                 n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
             break;
     }
+}
+
+// MUL_MAT_ID only writes the rows of the slots that belong to an expert; the rows of skipped slots
+// (negative ids) are left untouched by the GEMMs and are zeroed here, matching the CPU reference
+static __global__ void mm_ids_zero_skipped(
+        const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const int64_t ne0, const int64_t n_tokens, const int64_t n_expert_used,
+        const int64_t ids_s0, const int64_t ids_s1,
+        const int64_t dst_s1, const int64_t dst_s2) {
+    constexpr int lanes_per_pair = 32;
+
+    const int64_t pair = (int64_t) blockIdx.x*(blockDim.x/lanes_per_pair) + threadIdx.x/lanes_per_pair;
+    if (pair >= n_tokens*n_expert_used) {
+        return;
+    }
+
+    const int64_t it  = pair/n_expert_used;
+    const int64_t iex = pair%n_expert_used;
+    if (ids[it*ids_s1 + iex*ids_s0] >= 0) {
+        return;
+    }
+
+    float * row = (float *) ((char *) dst + iex*dst_s1 + it*dst_s2);
+    for (int64_t i0 = threadIdx.x%lanes_per_pair; i0 < ne0; i0 += lanes_per_pair) {
+        row[i0] = 0.0f;
+    }
+}
+
+void ggml_cuda_zero_skipped_mul_mat_id(
+        const int32_t * ids, float * dst,
+        const int64_t ne0, const int64_t n_tokens, const int64_t n_expert_used,
+        const int64_t ids_s0, const int64_t ids_s1,
+        const int64_t dst_s1, const int64_t dst_s2, cudaStream_t stream) {
+    const int64_t n_pairs = n_tokens*n_expert_used;
+    if (n_pairs == 0) {
+        return;
+    }
+    constexpr int nthreads = 128;
+    constexpr int npairs_per_block = nthreads/32;
+    const int64_t nblocks = (n_pairs + npairs_per_block - 1)/npairs_per_block;
+    mm_ids_zero_skipped<<<(int) nblocks, nthreads, 0, stream>>>(
+        ids, dst, ne0, n_tokens, n_expert_used, ids_s0, ids_s1, dst_s1, dst_s2);
 }

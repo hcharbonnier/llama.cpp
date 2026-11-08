@@ -14,3 +14,10 @@ void ggml_cuda_launch_mm_ids_helper(
         int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int tile_width,
         const int si1, const int sis1, const bool write_inverse, cudaStream_t stream);
+
+// zeroes the dst rows of slots whose id is -1, which the MUL_MAT_ID GEMMs never write
+void ggml_cuda_zero_skipped_mul_mat_id(
+        const int32_t * ids, float * dst,
+        const int64_t ne0, const int64_t n_tokens, const int64_t n_expert_used,
+        const int64_t ids_s0, const int64_t ids_s1,
+        const int64_t dst_s1, const int64_t dst_s2, cudaStream_t stream);

@@ -199,6 +199,15 @@ void ggml_cuda_mul_mat_q(
 
     cudaStream_t stream = ctx.stream();
 
+    if (ids) {
+        // no GEMM path writes the rows of skipped slots (negative ids), zero them up front
+        ggml_cuda_zero_skipped_mul_mat_id((const int32_t *) ids->data, (float *) dst->data,
+            dst->ne[0], ids->ne[1], ids->ne[0],
+            ids->nb[0]/ggml_element_size(ids), ids->nb[1]/ggml_element_size(ids),
+            dst->nb[1], dst->nb[2], stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     const int    id    = ggml_cuda_get_device();
     const int    cc    = ggml_cuda_info().devices[id].cc;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
@@ -331,6 +340,12 @@ void ggml_cuda_mul_mat_q(
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+
+    // skipped slots (negative ids) leave a hole in the compact row space; define the unused entries
+    // and tiles so no stale value is consumed. The inverse map marks skipped slots with -1.
+    CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), dedup_bcast ? 0xFF : 0, ne_get_rows*sizeof(int32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(ids_dst.get(),  0, (ne_get_rows + J_best - 1)*sizeof(int32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(tile_spec.get(), 0, ntj*sizeof(ggml_cuda_mm_id_tile_spec), stream));
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));

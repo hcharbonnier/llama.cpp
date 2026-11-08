@@ -18,6 +18,15 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
+    if (ids) {
+        // no GEMM path writes the rows of skipped slots (negative ids), zero them up front
+        ggml_cuda_zero_skipped_mul_mat_id((const int32_t *) ids->data, (float *) dst->data,
+            dst->ne[0], ids->ne[1], ids->ne[0],
+            ids->nb[0]/ggml_element_size(ids), ids->nb[1]/ggml_element_size(ids),
+            dst->nb[1], dst->nb[2], ctx.stream());
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     const size_t ts_src0 = ggml_type_size(src0->type);
     const size_t ts_src1 = ggml_type_size(src1->type);
     const size_t ts_dst  = ggml_type_size(dst->type);
@@ -80,6 +89,12 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         ids_src_compact_dev.alloc(ctx.pool(), ne_get_rows);
         ids_dst_compact_dev.alloc(ctx.pool(), ne_get_rows);
         tile_spec_dev.alloc(ctx.pool(), max_tiles);
+
+        // skipped slots (negative ids) leave a hole in the compact row space; zero the maps and
+        // tiles so the unused entries are well defined and the extra tiles become no-ops
+        CUDA_CHECK(cudaMemsetAsync(ids_src_compact_dev.get(), 0, ne_get_rows*sizeof(int32_t), ctx.stream()));
+        CUDA_CHECK(cudaMemsetAsync(ids_dst_compact_dev.get(), 0, ne_get_rows*sizeof(int32_t), ctx.stream()));
+        CUDA_CHECK(cudaMemsetAsync(tile_spec_dev.get(),        0, max_tiles*sizeof(ggml_cuda_mm_id_tile_spec), ctx.stream()));
 
         const int si1  = static_cast<int>(ids_s1);
         const int sis1 = static_cast<int>(src1->nb[2] / src1->nb[1]);

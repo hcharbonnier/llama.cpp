@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmid.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -683,6 +684,12 @@ static __global__ void mul_mat_vec_q(
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
+    if constexpr (ncols_dst == 1) {
+        if (!shared_expert && ids != nullptr && (int32_t) channel_x < 0) {
+            return; // skipped slot, zeroed with the other skipped rows
+        }
+    }
+
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
@@ -959,7 +966,11 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    const int32_t channel_x_i = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    if (channel_x_i < 0) {
+        return; // skipped slot, zeroed with the other skipped rows
+    }
+    const uint32_t channel_x = channel_x_i;
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
@@ -1500,6 +1511,15 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     cudaStream_t stream = ctx.stream();
+
+    if (ids) {
+        // no GEMM path writes the rows of skipped slots (negative ids), zero them up front
+        ggml_cuda_zero_skipped_mul_mat_id((const int32_t *) ids->data, (float *) dst->data,
+            dst->ne[0], ids->ne[1], ids->ne[0],
+            ids->nb[0]/ggml_element_size(ids), ids->nb[1]/ggml_element_size(ids),
+            dst->nb[1], dst->nb[2], stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     const size_t ts_src0 = ggml_type_size(src0->type);
     const size_t ts_src1 = ggml_type_size(src1->type);
