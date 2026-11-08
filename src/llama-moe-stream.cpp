@@ -30,7 +30,7 @@
 #endif
 #endif
 
-static const uint32_t MOE_STREAM_IO_THREADS_DEFAULT = 9;
+static const uint32_t MOE_STREAM_IO_THREADS_DEFAULT = 16;
 static const uint32_t MOE_STREAM_IO_THREADS_MAX     = 32;
 static const int64_t  MOE_STREAM_HOT_DECAY_TOKENS   = 64;
 static const size_t   MOE_STREAM_STAGING_MAX        = 1ull*1024*1024*1024; // cap on the total staging of the I/O workers
@@ -326,6 +326,11 @@ void llama_moe_stream::clamp_io_staging() {
                 MOE_STREAM_STAGING_MAX / 1024.0 / 1024.0);
         n_io_threads = max_threads;
     }
+
+    LLAMA_LOG_INFO("%s: MoE I/O threads = %d, staging = %.2f MiB per worker, %.2f MiB total (cap %.2f MiB)\n",
+            __func__, n_io_threads, staging_size / 1024.0 / 1024.0,
+            staging_size * (size_t) n_io_threads / 1024.0 / 1024.0,
+            MOE_STREAM_STAGING_MAX / 1024.0 / 1024.0);
 }
 
 void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
