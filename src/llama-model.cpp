@@ -4171,6 +4171,10 @@ int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
 }
 
+bool llama_model_moe_stream_enabled(const struct llama_model * model) {
+    return model->moe_stream() != nullptr;
+}
+
 ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i) {
     if (i < 0 || i >= (int)model->devices.size()) {
         return nullptr;

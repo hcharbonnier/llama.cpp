@@ -2821,6 +2821,11 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
+        if (llama_model_moe_stream_enabled(model_tgt) && !llama_model_moe_stream_enabled(model_dft) &&
+                llama_model_n_expert(model_dft) > 0) {
+            LOG_WRN("%s: the target model streams MoE experts from disk, but the draft model is a MoE loaded fully resident (draft streaming is disabled); this can make the memory fit fail or reduce the target expert cache\n", __func__);
+        }
+
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
