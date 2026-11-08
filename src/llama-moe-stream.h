@@ -143,6 +143,9 @@ struct llama_moe_stream {
     // allocate the cache tensor buffers (after all create_cache_tensor calls)
     void alloc_bufs(bool no_alloc);
 
+    // cap n_io_threads so the per-worker staging buffers stay under a fixed total
+    void clamp_io_staging();
+
     // reopen the GGUF files for streaming reads
     void open_files(const std::vector<std::string> & paths);
 

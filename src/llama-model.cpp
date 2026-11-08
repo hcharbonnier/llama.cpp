@@ -2227,6 +2227,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 pimpl->moe_stream->open_files(ml.file_paths);
                 pimpl->moe_stream->pin_partition(hparams.n_expert_used_max());
                 pimpl->moe_stream->fill_host_mirror();
+                pimpl->moe_stream->clamp_io_staging();
             }
         }
     }
