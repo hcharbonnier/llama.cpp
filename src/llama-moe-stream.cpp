@@ -399,8 +399,8 @@ static std::vector<llama_files> llama_moe_stream_open_thread_files(const std::ve
 // never pay a load again. The remaining slots form the dynamic pool used by the wave planner and
 // the remap. A cache too small to spare slots for the pool leaves every slot dynamic.
 void llama_moe_stream::pin_partition(uint32_t n_expert_used) {
-    // the dynamic pool must hold one wave plus its preload plus the parked pairs
-    const uint32_t n_dyn_min = std::max<uint32_t>(3*n_expert_used, 8);
+    // the dynamic pool must hold one wave plus its preload, so two waves of n_expert_used
+    const uint32_t n_dyn_min = std::max<uint32_t>(2*n_expert_used, 8);
 
     const int64_t t_start = ggml_time_us();
 
@@ -1040,32 +1040,13 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
 
 // make wave w's expert slice (uniq[w*cap .. +count)) resident, waiting for its loads, and best-effort
 // preload the next wave so its loads overlap this wave's compute. leaves sl.demand_slots = this wave's
-// slots and sl.plan_pool = the resident parking pool (>= n_ids slots) the emit draws masked pairs from
-void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w, uint32_t n_ids) {
+// slots
+void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w) {
     const size_t first = (size_t) w*sl.plan_capacity;
     const size_t count = first < sl.uniq.size() ? std::min<size_t>(sl.plan_capacity, sl.uniq.size() - first) : 0;
 
     std::fill(sl.keep.begin(), sl.keep.end(), 0);
     sl.demand_slots.clear();
-
-    // a small final wave has fewer than n_ids own slots; borrow the rest from the pinned partition
-    //   when possible, else from the previous wave's pool, so every token row has n_ids distinct
-    //   resident parking slots for its masked pairs
-    std::vector<int32_t> borrowed;
-    if (count < n_ids) {
-        const size_t need = n_ids - count;
-        if (sl.n_pinned >= need) {
-            for (size_t i = 0; i < need; i++) {
-                borrowed.push_back((int32_t) i);
-            }
-        } else {
-            GGML_ASSERT(sl.plan_pool.size() >= need);
-            for (size_t i = 0; i < need; i++) {
-                borrowed.push_back(sl.plan_pool[i]);
-                sl.keep[sl.plan_pool[i]] = 1; // parking slots must survive this wave's loads
-            }
-        }
-    }
 
     // protect the next wave's already-resident experts so this wave's victims do not evict them
     const size_t nfirst = first + sl.plan_capacity;
@@ -1160,52 +1141,26 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
         }
         stats.t_stall_wave_us += ggml_time_us() - t0;
     }
-
-    // parking pool: this wave's own resident slots plus the borrowed ones (all keep-protected;
-    //   the next same-layer reservation is ordered after this wave's GEMMs by the graph)
-    sl.plan_pool = sl.demand_slots;
-    sl.plan_pool.insert(sl.plan_pool.end(), borrowed.begin(), borrowed.end());
-    GGML_ASSERT(sl.plan_pool.size() >= n_ids);
 }
 
-// write out[i] = the cache slot the GEMM should index for each (token, expert) pair of wave w, one
-// token row at a time: pairs whose expert is in this wave get its real slot; the rest park on distinct
-// resident pool slots (pool_used prevents a repeat within the row, required by the Metal kernel)
+// write out[i] = the cache slot the GEMM should index for each (token, expert) pair of wave w;
+// pairs whose expert belongs to another wave get -1 and are skipped by mul_mat_id
 void llama_moe_stream::emit_wave_slots(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out,
         int32_t w, uint32_t n_ids, int64_t n_tok) {
     for (int64_t t = 0; t < n_tok; t++) {
-        sl.pool_used.clear();
-
-        // pass 1: pairs whose expert belongs to this wave -> that expert's real (resident) slot
         for (uint32_t kk = 0; kk < n_ids; kk++) {
             const int64_t i = t*n_ids + kk;
             const int32_t e = ids[i];
             GGML_ASSERT(sl.expert_wave[e] != 0xff);
-            if (sl.expert_wave[e] == (uint8_t) w) {
-                const int32_t s = sl.expert_slot[e];
-                GGML_ASSERT(s >= 0);
-                GGML_ASSERT(sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_RESIDENT);
-                sl.slot_last_use[s] = ++sl.use_counter;
-                out[i] = s;
-                sl.pool_used.push_back(s);
-            }
-        }
-
-        // pass 2: the remaining (masked) pairs -> the next pool slot not yet used in this row
-        size_t pi = 0;
-        for (uint32_t kk = 0; kk < n_ids; kk++) {
-            const int64_t i = t*n_ids + kk;
-            if (sl.expert_wave[ids[i]] == (uint8_t) w) {
+            if (sl.expert_wave[e] != (uint8_t) w) {
+                out[i] = -1;
                 continue;
             }
-            while (std::find(sl.pool_used.begin(), sl.pool_used.end(), sl.plan_pool[pi]) != sl.pool_used.end()) {
-                pi++;
-                GGML_ASSERT(pi < sl.plan_pool.size());
-            }
-            GGML_ASSERT(sl.slot_state[sl.plan_pool[pi]] == LLAMA_MOE_STREAM_SLOT_RESIDENT);
-            out[i] = sl.plan_pool[pi];
-            sl.pool_used.push_back(sl.plan_pool[pi]);
-            pi++;
+            const int32_t s = sl.expert_slot[e];
+            GGML_ASSERT(s >= 0);
+            GGML_ASSERT(sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_RESIDENT);
+            sl.slot_last_use[s] = ++sl.use_counter;
+            out[i] = s;
         }
     }
 }
@@ -1252,14 +1207,14 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
 
     const uint32_t n_ids = (uint32_t) a->ne[0]; // experts per token (n_expert_used)
 
-    mgr->stage_wave_locked(lk, *sl, w, n_ids); // make this wave resident, preload the next, build the pool
+    mgr->stage_wave_locked(lk, *sl, w); // make this wave resident, preload the next
     sl->plan_next_wave = w + 1;
 
     mgr->emit_wave_slots(*sl, ids, out, w, n_ids, a->ne[1]);
 }
 
 // multi-pass prefill: 1.0 for pairs whose expert belongs to wave w, 0.0 otherwise; multiplied into
-// this wave's expert GEMM output so the masked-out (parked) pairs contribute nothing to the sum
+// this wave's expert GEMM output so the pairs of other waves contribute nothing to the sum
 void llama_moe_stream_wave_mask(ggml_tensor * dst, int ith, int nth, void * userdata) {
     GGML_UNUSED(nth);
     if (ith != 0) {

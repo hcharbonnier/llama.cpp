@@ -1744,13 +1744,13 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
         n_slots = std::max<uint32_t>(2*hparams.n_expert_used_max(), 16);
     }
 
-    // multi-pass prefill keeps the current wave, the preloaded next wave and n_expert_used
-    // parking slots resident at once, so a wave needs at least 3*n_expert_used experts
-    const uint32_t n_slots_min = 3*hparams.n_expert_used_max();
+    // multi-pass prefill keeps the current wave and the preloaded next wave resident at once,
+    // so the dynamic pool needs at least 2*n_expert_used slots
+    const uint32_t n_slots_min = 2*hparams.n_expert_used_max();
 
     if (n_slots_min >= hparams.n_expert) {
         // a cache this large would hold every expert, so streaming cannot help for this model
-        LLAMA_LOG_WARN("%s: MoE expert streaming needs at least %u slots (3*n_expert_used) for multi-pass prefill, but the model has only %u experts -- streaming disabled, loading normally\n",
+        LLAMA_LOG_WARN("%s: MoE expert streaming needs at least %u slots (2*n_expert_used) for multi-pass prefill, but the model has only %u experts -- streaming disabled, loading normally\n",
                 __func__, n_slots_min, hparams.n_expert);
         return 0;
     }
@@ -1759,10 +1759,10 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
         if (cache_from_params) {
             // an explicit --moe-stream-cache is a hard budget: fail at load instead of hitting
             // the graph-build abort on the first batch that needs multi-pass prefill
-            throw std::runtime_error(format("%s: --moe-stream-cache gives %u slots per layer, but multi-pass prefill needs at least %u (3*n_expert_used); increase --moe-stream-cache or reduce -ub",
+            throw std::runtime_error(format("%s: --moe-stream-cache gives %u slots per layer, but multi-pass prefill needs at least %u (2*n_expert_used); increase --moe-stream-cache or reduce -ub",
                     __func__, n_slots, n_slots_min));
         }
-        LLAMA_LOG_WARN("%s: raising MoE expert cache from %u to %u slots (3*n_expert_used)\n",
+        LLAMA_LOG_WARN("%s: raising MoE expert cache from %u to %u slots (2*n_expert_used)\n",
                 __func__, n_slots, n_slots_min);
         n_slots = n_slots_min;
     }
