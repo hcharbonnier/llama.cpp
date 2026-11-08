@@ -2720,6 +2720,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
             }
         }
     }
+    // the streamed expert cache lives in its own contexts, count it as model memory
+    if (pimpl->moe_stream) {
+        for (const auto & [buft, size] : pimpl->moe_stream->memory_breakdown()) {
+            ret[buft] += size;
+        }
+    }
     return ret;
 }
 

@@ -156,6 +156,9 @@ struct llama_moe_stream {
 
     size_t size_bufs() const;
 
+    // memory the cache buffers use, per buffer type; with no_alloc this is the projected size
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+
     // file ranges [first, last) of the streamed expert data, per GGUF file index; used to keep
     // the mmap prefetch and mlock off the data that is streamed from disk
     void file_ranges(std::map<uint32_t, llama_mmap::ranges> & out) const;
@@ -179,6 +182,7 @@ struct llama_moe_stream {
 
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context_ptr>> ctxs; // one per buft
     std::vector<ggml_backend_buffer_ptr> bufs;
+    bool no_alloc = false; // dummy buffers were attached, buffer sizes are only projected
 
     // load pool (queue and all layer residency state guarded by mtx)
     mutable std::mutex      mtx;
