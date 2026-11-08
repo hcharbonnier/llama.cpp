@@ -437,6 +437,7 @@ extern "C" {
         // IQ1_S's 8-element ternary codebook with a narrower index; see ggml-common.h.
         // 45..63 stay reserved for upstream, so fork-local types start at 64 and a stock
         // build rejects these files instead of misreading them.
+        // only the CPU and CUDA backends implement the IQ1_XS, IQ1_XXS and IQ1_XXXS types
         GGML_TYPE_IQ1_XS   = 64, // 1.4375 bpw, 1024-entry grid
         GGML_TYPE_IQ1_XXS  = 65, // 1.3125 bpw,  512-entry grid
         GGML_TYPE_IQ1_XXXS = 66, // 1.1875 bpw,  256-entry grid
