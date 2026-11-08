@@ -238,6 +238,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         sl->slot_gen     .resize(n_slots, 0);
         sl->slot_last_use.resize(n_slots, 0);
         sl->route_hotness.resize(n_expert, 0);
+        sl->expert_slot  .resize(n_expert, -1);
         sl->seen         .resize(n_expert, 0);
         sl->keep         .resize(n_slots, 0);
     }
@@ -819,7 +820,7 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t 
         if (debug) {
             LLAMA_LOG_DEBUG("%s: layer %d: evict expert %d from slot %d\n", __func__, sl.il, sl.slot_expert[slot], slot);
         }
-        sl.expert_slot.erase(sl.slot_expert[slot]);
+        sl.expert_slot[sl.slot_expert[slot]] = -1;
     }
 
     sl.slot_expert[slot] = expert;
@@ -914,9 +915,8 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
 
     bool waited = false;
     for (const int32_t e : sl->uniq) {
-        const auto it = sl->expert_slot.find(e);
-        if (it != sl->expert_slot.end()) {
-            const int32_t s = it->second;
+        const int32_t s = sl->expert_slot[e];
+        if (s >= 0) {
             if (sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
                 mgr->q_demand.push_back({ sl, e, s, sl->slot_gen[s] });
                 mgr->cv_work.notify_one();
@@ -967,7 +967,8 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     }
 
     for (int64_t i = 0; i < n; i++) {
-        const int32_t s = sl->expert_slot.at(ids[i]);
+        const int32_t s = sl->expert_slot[ids[i]];
+        GGML_ASSERT(s >= 0);
         sl->slot_last_use[s] = ++sl->use_counter;
         out[i] = s;
     }
@@ -1070,9 +1071,9 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
     const size_t nfirst = first + sl.plan_capacity;
     const size_t ncount = nfirst < sl.uniq.size() ? std::min<size_t>(sl.plan_capacity, sl.uniq.size() - nfirst) : 0;
     for (size_t i = nfirst; i < nfirst + ncount; i++) {
-        const auto it = sl.expert_slot.find(sl.uniq[i]);
-        if (it != sl.expert_slot.end()) {
-            sl.keep[it->second] = 1;
+        const int32_t s = sl.expert_slot[sl.uniq[i]];
+        if (s >= 0) {
+            sl.keep[s] = 1;
         }
     }
 
@@ -1082,10 +1083,9 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
         stats.n_waves_run++;
         for (size_t i = first; i < first + count; i++) {
             const int32_t e  = sl.uniq[i];
-            const auto    it = sl.expert_slot.find(e);
-            if (it != sl.expert_slot.end()) {
+            const int32_t s  = sl.expert_slot[e];
+            if (s >= 0) {
                 // already in the cache (resident, or still loading from the previous wave's preload)
-                const int32_t s = it->second;
                 if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
                     q_demand.push_back({ &sl, e, s, sl.slot_gen[s] }); // promote to demand, wait for it
                     cv_work.notify_one();
@@ -1124,7 +1124,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
     if (std::getenv("LLAMA_MOE_STREAM_NO_PRELOAD") == nullptr) {
         for (size_t i = nfirst; i < nfirst + ncount; i++) {
             const int32_t e = sl.uniq[i];
-            if (sl.expert_slot.find(e) != sl.expert_slot.end()) {
+            if (sl.expert_slot[e] >= 0) {
                 continue;
             }
             const int32_t v = pick_victim_locked(sl, sl.keep.data());
@@ -1182,7 +1182,8 @@ void llama_moe_stream::emit_wave_slots(llama_moe_stream_layer & sl, const int32_
             const int32_t e = ids[i];
             GGML_ASSERT(sl.expert_wave[e] != 0xff);
             if (sl.expert_wave[e] == (uint8_t) w) {
-                const int32_t s = sl.expert_slot.at(e);
+                const int32_t s = sl.expert_slot[e];
+                GGML_ASSERT(s >= 0);
                 GGML_ASSERT(sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_RESIDENT);
                 sl.slot_last_use[s] = ++sl.use_counter;
                 out[i] = s;

@@ -12,7 +12,6 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -81,7 +80,7 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t>                 slot_claimed;  // [n_slots] a worker owns the load
     std::vector<uint64_t>                slot_gen;      // [n_slots] reservation generation
     std::vector<int64_t>                 slot_last_use; // [n_slots] LRU stamps
-    std::unordered_map<int32_t, int32_t> expert_slot;   // RESIDENT and LOADING entries
+    std::vector<int32_t>                 expert_slot;   // [n_expert] RESIDENT or LOADING slot, -1 if absent
 
     std::vector<uint32_t> route_hotness; // [n_expert] decayed selection counts, for eviction
     std::vector<uint8_t>  seen;          // [n_expert] for cold-miss attribution
