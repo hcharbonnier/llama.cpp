@@ -29,8 +29,9 @@
 //
 // The cache is partitioned: its low slots permanently hold the experts of the same ids and are
 // never evicted, the remaining slots form the dynamic pool the wave planner and the remap draw
-// from. A pinned host mirror holds the experts the partition does not cover, so their misses cross
-// PCIe instead of reading the model file, and no expert is stored twice between the two tiers.
+// from. A pinned host mirror holds an even share of the unpinned experts of every streamed layer,
+// so their misses cross PCIe instead of reading the model file, and no expert is stored twice
+// between the two tiers.
 //
 // note: multiple contexts decoding the same streamed model concurrently are not supported -
 // one context can evict slots referenced by the other's in-flight graph.
@@ -51,8 +52,9 @@ struct llama_moe_stream_weight {
     size_t   offs      = 0; // file offset of the full exps tensor data
     size_t   nb_expert = 0; // bytes per expert slab
 
-    const uint8_t * host       = nullptr; // pinned host mirror of the unpinned experts, null when unmirrored
-    uint32_t        host_first = 0;       // first expert the mirror holds
+    const uint8_t * host       = nullptr; // pinned host mirror of a contiguous range of unpinned experts
+    uint32_t        host_first = 0;       // first mirrored expert id
+    uint32_t        host_last  = 0;       // one past the last mirrored expert id
 };
 
 struct llama_moe_stream_layer;
@@ -148,7 +150,7 @@ struct llama_moe_stream {
 
     // the low slots permanently hold the experts of the same ids; the rest form the dynamic pool
     void pin_partition(uint32_t n_expert_used);
-    // fill the pinned host mirror with the experts the partition does not cover
+    // fill the pinned host mirror with an even share of the unpinned experts of every layer
     void fill_host_mirror();
 
     size_t size_bufs() const;

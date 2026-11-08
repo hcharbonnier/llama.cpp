@@ -500,9 +500,10 @@ void llama_moe_stream::pin_partition(uint32_t n_expert_used) {
             __func__, n_pinned, n_expert, n_slots - n_pinned, (ggml_time_us() - t_start)/1e6);
 }
 
-// mirror the experts the partition does not cover in pinned host memory, so their misses are a
-// PCIe copy instead of a file read. Filled layer by layer; stops at the first layer that does not
-// fit the budget, the remaining layers keep reading the file.
+// mirror an even share of the unpinned experts of every streamed layer in pinned host memory, so
+// their misses are a PCIe copy instead of a file read. The budget is split by layer, not consumed
+// as a prefix: every layer gets the same share of the budget, and a layer whose share cannot hold
+// a whole expert keeps reading the file.
 void llama_moe_stream::fill_host_mirror() {
     if (ram_budget == 0) {
         return;
@@ -513,12 +514,45 @@ void llama_moe_stream::fill_host_mirror() {
     struct job { llama_moe_stream_weight * wt; uint32_t first; uint32_t last; uint8_t * dst; };
     std::vector<job> jobs;
 
-    size_t   left       = ram_budget;
+    auto expert_bytes = [](const llama_moe_stream_layer & sl) {
+        size_t nb = 0;
+        for (const auto & wt : sl.weights) {
+            nb += wt.nb_expert;
+        }
+        return nb;
+    };
+
+    uint32_t n_mirror_layers = 0;
+    uint32_t n_device        = 0;
+    uint32_t n_host          = 0;
+
+    for (const auto & sl_ptr : layers) {
+        if (sl_ptr == nullptr) {
+            continue;
+        }
+        const auto & sl = *sl_ptr;
+
+        if (ggml_backend_buffer_is_host(sl.weights[0].cache->buffer)) {
+            n_host++;
+            continue; // the cache already lives in RAM, a mirror would duplicate it
+        }
+        n_device++;
+        if (sl.n_expert > sl.n_pinned && expert_bytes(sl) > 0) {
+            n_mirror_layers++;
+        }
+    }
+
+    if (n_device == 0) {
+        if (n_host > 0) {
+            LLAMA_LOG_WARN("%s: expert cache is in host memory, host mirror is redundant -- disabled\n", __func__);
+        }
+        return;
+    }
+
+    const size_t budget_per_layer = n_mirror_layers > 0 ? ram_budget / n_mirror_layers : 0;
+
     uint32_t n_layers   = 0;
     size_t   n_mirrored = 0;
-    uint32_t n_device   = 0;
-    uint32_t n_host     = 0;
-    bool     stop       = false;
 
     for (auto & sl_ptr : layers) {
         if (sl_ptr == nullptr) {
@@ -527,29 +561,24 @@ void llama_moe_stream::fill_host_mirror() {
         auto & sl = *sl_ptr;
 
         if (ggml_backend_buffer_is_host(sl.weights[0].cache->buffer)) {
-            n_host++;
-            continue; // the cache already lives in RAM, a mirror would duplicate it
+            continue;
         }
-        n_device++;
-
-        if (stop) {
+        if (sl.n_expert <= sl.n_pinned) {
             continue;
         }
 
-        const uint32_t n_host_expert = sl.n_expert - sl.n_pinned;
+        const size_t   nb_expert  = expert_bytes(sl);
+        const uint32_t n_unpinned = sl.n_expert - sl.n_pinned;
+        if (nb_expert == 0) {
+            continue;
+        }
+
+        const uint32_t n_host_expert = (uint32_t) std::min<size_t>(n_unpinned, budget_per_layer / nb_expert);
         if (n_host_expert == 0) {
             continue;
         }
 
-        size_t nb_layer = 0;
-        for (const auto & wt : sl.weights) {
-            nb_layer += (size_t) n_host_expert*wt.nb_expert;
-        }
-        if (nb_layer > left) {
-            LLAMA_LOG_WARN("%s: host mirror budget too small for layer %d, mirroring stops here\n", __func__, sl.il);
-            stop = true;
-            continue;
-        }
+        const size_t nb_layer = (size_t) n_host_expert*nb_expert;
 
         // the mirror feeds device copies, so it must live in a pinned host buffer to keep the DMA
         // direct; a pageable or device buffer would defeat the point (and a device base is not
@@ -562,54 +591,42 @@ void llama_moe_stream::fill_host_mirror() {
         }
         ggml_backend_buffer_type_t buft = dev != nullptr ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
         if (!props.caps.host_buffer || buft == nullptr || !ggml_backend_buft_is_host(buft)) {
-            LLAMA_LOG_WARN("%s: no pinned host buffer type for layer %d, host mirror disabled\n", __func__, sl.il);
-            stop = true;
-            continue;
+            LLAMA_LOG_WARN("%s: no pinned host buffer type for layer %d, mirroring stops here\n", __func__, sl.il);
+            break;
         }
 
         ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, nb_layer);
         if (buf == nullptr) {
-            LLAMA_LOG_WARN("%s: host mirror allocation failed at layer %d, mirroring stops here\n", __func__, sl.il);
-            stop = true;
+            LLAMA_LOG_WARN("%s: host mirror allocation failed at layer %d, layer reads from file\n", __func__, sl.il);
             continue;
         }
         if (ggml_backend_buffer_get_type(buf) != buft) {
             // the pinned allocation fell back to pageable memory: keep streaming from disk instead
             ggml_backend_buffer_free(buf);
-            LLAMA_LOG_WARN("%s: pinned host allocation fell back to pageable memory at layer %d, host mirror disabled\n",
+            LLAMA_LOG_WARN("%s: pinned host allocation fell back to pageable memory at layer %d, layer reads from file\n",
                     __func__, sl.il);
-            stop = true;
             continue;
         }
 
         uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf);
         if (base == nullptr) {
             ggml_backend_buffer_free(buf);
-            LLAMA_LOG_WARN("%s: host mirror buffer has no CPU base at layer %d, mirroring stops here\n", __func__, sl.il);
-            stop = true;
+            LLAMA_LOG_WARN("%s: host mirror buffer has no CPU base at layer %d, layer reads from file\n", __func__, sl.il);
             continue;
         }
         host_bufs.emplace_back(buf);
 
         for (auto & wt : sl.weights) {
-            jobs.push_back({ &wt, sl.n_pinned, sl.n_expert, base });
+            jobs.push_back({ &wt, sl.n_pinned, sl.n_pinned + n_host_expert, base });
             base += (size_t) n_host_expert*wt.nb_expert;
         }
 
-        left       -= nb_layer;
         n_mirrored += nb_layer;
         n_layers++;
     }
 
-    if (n_device == 0) {
-        if (n_host > 0) {
-            LLAMA_LOG_WARN("%s: expert cache is in host memory, host mirror is redundant -- disabled\n", __func__);
-        }
-        return;
-    }
-
     if (jobs.empty()) {
-        LLAMA_LOG_WARN("%s: no layer could be mirrored, host mirror disabled (see warnings above)\n", __func__);
+        LLAMA_LOG_WARN("%s: no layer could be mirrored, host mirror disabled\n", __func__);
         return;
     }
 
@@ -654,6 +671,7 @@ void llama_moe_stream::fill_host_mirror() {
     for (const auto & j : jobs) {
         j.wt->host       = j.dst;
         j.wt->host_first = j.first;
+        j.wt->host_last  = j.last;
     }
 
     LLAMA_LOG_INFO("%s: expert host mirror = %.2f GiB over %u layers (%.2f s)\n",
@@ -746,7 +764,7 @@ void llama_moe_stream::worker_loop() {
         bool from_ram = true;
         for (const auto & wt : sl.weights) {
             const uint8_t * data = nullptr;
-            if (wt.host != nullptr && (uint32_t) w.expert >= wt.host_first) {
+            if (wt.host != nullptr && (uint32_t) w.expert >= wt.host_first && (uint32_t) w.expert < wt.host_last) {
                 // pinned host mirror: the miss is a PCIe copy, not a file read
                 data = wt.host + (size_t) (w.expert - wt.host_first)*wt.nb_expert;
             } else {
