@@ -722,6 +722,7 @@ static int server_run_instance(common_params & params, server_role & role, commo
 
     auto * ll_ctx = ctx_server.get_llama_context();
     if (ll_ctx != nullptr) {
+        llama_moe_stream_print_stats(llama_get_model(ll_ctx));
         common_memory_breakdown_print(ll_ctx);
     }
 
