@@ -198,6 +198,7 @@ struct llama_moe_stream {
     bool load_failed     = false;
 
     bool debug = false;
+    bool trace = false; // LLAMA_MOE_STREAM_TRACE: log distinct expert ids per single-wave remap
 
     struct {
         int64_t n_calls     = 0; // stream calls (remap + wave plans)

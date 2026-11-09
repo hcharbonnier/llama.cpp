@@ -227,6 +227,7 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
     this->n_io_threads = std::min<int32_t>(this->n_io_threads, MOE_STREAM_IO_THREADS_MAX);
 
     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
+    trace         = std::getenv("LLAMA_MOE_STREAM_TRACE") != nullptr;
     use_direct_io = direct;
 }
 
@@ -1040,6 +1041,16 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         GGML_ABORT("MoE expert streaming: layer %d needs %zu distinct experts but the cache has only %u slots; "
                    "increase --moe-stream-cache or reduce the ubatch size (-ub)",
                 sl->il, sl->uniq.size(), sl->n_slots);
+    }
+
+    // routing trace (off by default); n = number of router ids, so a single-token decode call has n == n_expert_used
+    // multi-pass prefill never reaches this op, so it is not traced
+    if (mgr->trace) {
+        std::fprintf(stderr, "moe trace: layer=%d call=%" PRId64 " n=%" PRId64 " ids=", sl->il, mgr->stats.n_calls, n);
+        for (size_t i = 0; i < sl->uniq.size(); i++) {
+            std::fprintf(stderr, i == 0 ? "%d" : ",%d", sl->uniq[i]);
+        }
+        std::fputc('\n', stderr);
     }
 
     // route hotness for eviction; halved periodically so a formerly-hot expert ages out
