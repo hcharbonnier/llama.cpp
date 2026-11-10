@@ -2794,7 +2794,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_STREAM_CACHE"));
     add_opt(common_arg(
         {"--moe-stream-ram"}, "N|auto",
-        "host mirror for --moe-stream: pinned memory budget in GiB holding the experts the cache does not keep, "
+        "host tier for --moe-stream: pinned memory budget in GiB holding the experts the cache does not keep, "
         "so their misses cross PCIe instead of reading the model file, or 'auto' for half of the available physical RAM; "
         "an explicit budget is used as requested; implies --moe-stream (default: 0)",
         [](common_params & params, const std::string & value) {
@@ -2819,6 +2819,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_stream_ram = (uint64_t) budget_gb * 1024ull * 1024ull * 1024ull;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_RAM"));
+    add_opt(common_arg(
+        {"--moe-stream-ram-policy"}, "static|hot|hot-seeded",
+        "host tier policy for --moe-stream: static keeps a fixed even mirror of the unpinned experts (default); "
+        "hot keeps a dynamic per-layer cache filled on admitted misses and evicted by route hotness + LRU; "
+        "hot-seeded starts the dynamic cache with the static mirror content; "
+        "implies --moe-stream (default: static)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream = true;
+            if (value == "static") {
+                params.moe_stream_ram_hot  = false;
+                params.moe_stream_ram_seed = false;
+            } else if (value == "hot") {
+                params.moe_stream_ram_hot  = true;
+                params.moe_stream_ram_seed = false;
+            } else if (value == "hot-seeded") {
+                params.moe_stream_ram_hot  = true;
+                params.moe_stream_ram_seed = true;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_RAM_POLICY"));
+    add_opt(common_arg(
+        {"--moe-stream-ram-prefill"},
+        "hot host tier: also admit experts on second access during multi-wave prefill; "
+        "implies --moe-stream (only used with --moe-stream-ram-policy hot)",
+        [](common_params & params) {
+            params.moe_stream = true;
+            params.moe_stream_ram_prefill = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_RAM_PREFILL"));
     add_opt(common_arg(
         {"--moe-stream-pin"}, "N",
         "max experts kept permanently resident per layer for --moe-stream, trading VRAM for fewer prefill waves "

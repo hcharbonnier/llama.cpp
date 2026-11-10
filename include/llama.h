@@ -362,6 +362,9 @@ extern "C" {
         int32_t  moe_stream_io_threads; // expert load I/O threads (<= 0 = default)
         bool     moe_stream_direct;     // use O_DIRECT for expert reads (bypass page cache); falls back if unsupported
         bool     moe_stream_ram_auto;   // derive moe_stream_ram from available physical RAM (half of it)
+        bool     moe_stream_ram_hot;    // hot host tier: dynamic per-layer cache instead of a static mirror
+        bool     moe_stream_ram_seed;   // hot host tier: seed the dynamic cache with the static mirror content
+        bool     moe_stream_ram_prefill; // hot host tier: also admit experts during multi-wave prefill
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

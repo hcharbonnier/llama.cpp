@@ -2753,6 +2753,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.moe_stream_budget   = 0;
     result.moe_stream_ram      = 0;
     result.moe_stream_ram_auto = false;
+    result.moe_stream_ram_hot  = false;
+    result.moe_stream_ram_seed = false;
+    result.moe_stream_ram_prefill = false;
     result.moe_stream_pin      = 0;
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend

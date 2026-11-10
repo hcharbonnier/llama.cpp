@@ -29,9 +29,10 @@
 //
 // The cache is partitioned: its low slots permanently hold the experts of the same ids and are
 // never evicted, the remaining slots form the dynamic pool the wave planner and the remap draw
-// from. A pinned host mirror holds an even share of the unpinned experts of every streamed layer,
-// so their misses cross PCIe instead of reading the model file, and no expert is stored twice
-// between the two tiers.
+// from. A pinned host tier sits below it, with a static mirror of unpinned experts by default, or
+// a dynamic per-layer cache with second-access admission and hotness+LRU eviction
+// (--moe-stream-ram-policy hot). The dynamic cache can start from the static mirror content
+// (hot-seeded) and admit during prefill (--moe-stream-ram-prefill). No expert is stored twice.
 //
 // note: multiple contexts decoding the same streamed model concurrently are not supported -
 // one context can evict slots referenced by the other's in-flight graph.
@@ -55,6 +56,8 @@ struct llama_moe_stream_weight {
     const uint8_t * host       = nullptr; // pinned host mirror of a contiguous range of unpinned experts
     uint32_t        host_first = 0;       // first mirrored expert id
     uint32_t        host_last  = 0;       // one past the last mirrored expert id
+
+    const uint8_t * host_cache = nullptr; // hot policy: pinned host cache base, n_host_slots slabs of this weight
 };
 
 struct llama_moe_stream_layer;
@@ -88,6 +91,18 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t>  seen;          // [n_expert] for cold-miss attribution
     int64_t use_counter = 0;
 
+    // hot host cache, guarded by mgr->mtx: n_host_slots pinned slabs filled on device misses
+    uint32_t              n_host_slots = 0;
+    std::vector<int32_t>  host_slot_expert;   // [n_host_slots] expert id or -1
+    std::vector<uint8_t>  host_slot_state;    // [n_host_slots] llama_moe_stream_slot_state
+    std::vector<uint32_t> host_slot_ref;      // [n_host_slots] claimed readers/writers, never evicted
+    std::vector<uint64_t> host_slot_gen;      // [n_host_slots] reservation generation
+    std::vector<int64_t>  host_slot_last_use; // [n_host_slots] LRU stamps
+    std::vector<int32_t>  expert_host_slot;   // [n_expert] host slot, -1 if absent
+    std::vector<int64_t>  last_miss;          // [n_expert] layer clock of the last host miss
+    int64_t layer_calls      = 0;             // per-layer mono-wave remap clock
+    int64_t host_use_counter = 0;
+
     // scratch for the remap callback
     std::vector<int32_t> uniq;
     std::vector<uint8_t> touched;
@@ -119,6 +134,9 @@ struct llama_moe_stream_work {
     int32_t  expert = -1;
     int32_t  slot   = -1;
     uint64_t gen    = 0; // stale unless it matches slot_gen[slot]
+
+    bool     admit  = false; // hot policy: allow host insertion
+    int64_t  call   = 0;     // layer clock when the load was enqueued
 };
 
 struct llama_moe_stream {
@@ -128,7 +146,7 @@ struct llama_moe_stream {
 
     std::vector<std::unique_ptr<llama_moe_stream_layer>> layers; // [n_layer], null = not streamed
 
-    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint64_t ram_budget, int32_t pin_max, bool ram_auto);
+    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint64_t ram_budget, int32_t pin_max, bool ram_auto, bool ram_hot, bool ram_seed, bool ram_prefill);
     ~llama_moe_stream();
 
     llama_moe_stream_layer * layer(int32_t il) const {
@@ -153,6 +171,10 @@ struct llama_moe_stream {
     void pin_partition(uint32_t n_expert_used);
     // fill the pinned host mirror with an even share of the unpinned experts of every layer
     void fill_host_mirror();
+    // allocate the dynamic per-layer host cache (hot policy); starts empty and fills on device misses
+    void setup_host_cache();
+    // hot-seeded policy: fill the dynamic cache slots with the static mirror experts at load time
+    void fill_host_cache_seed();
 
     size_t size_bufs() const;
 
@@ -173,8 +195,11 @@ struct llama_moe_stream {
     // concurrent reads on a shared handle)
     std::vector<std::string> file_paths;
 
-    size_t ram_budget = 0; // pinned host mirror budget in bytes
+    size_t ram_budget = 0; // pinned host tier budget in bytes
     bool   ram_auto   = false; // ram_budget is derived from available physical RAM at load
+    bool   ram_hot    = false; // --moe-stream-ram-policy hot: dynamic host cache, not a static mirror
+    bool   ram_seed   = false; // --moe-stream-ram-policy hot-seeded: start from the static mirror content
+    bool   ram_prefill = false; // --moe-stream-ram-prefill: admit during multi-wave prefill too
     int32_t pin_max = -1;  // max pinned experts per layer (-1 = auto, 0 = none)
     std::vector<ggml_backend_buffer_ptr> host_bufs;
 
@@ -205,9 +230,14 @@ struct llama_moe_stream {
         int64_t n_hit       = 0; // touched experts already resident or loading
         int64_t n_miss      = 0; // demand loads issued
         int64_t n_miss_cold = 0; // first-ever touch of an expert
-        int64_t n_load_ram  = 0; // expert loads served by the pinned host mirror
+        int64_t n_load_ram  = 0; // expert loads served by the pinned host tier
         int64_t n_load_disk = 0; // expert loads read from the model file
         int64_t t_stall_us  = 0; // wait time in miss handling
+
+        int64_t host_hits      = 0; // hot policy: device loads served from the host cache
+        int64_t host_misses    = 0; // hot policy: host lookups that read the file
+        int64_t host_evictions = 0; // hot policy: resident host slots reused for another expert
+        int64_t t_host_insert_us = 0; // hot policy: time spent copying slabs into the host cache
 
         int64_t n_wave_calls     = 0; // wave-ids invocations (>= n_calls under multi-pass prefill)
         int64_t n_waves_run      = 0; // non-empty waves
@@ -222,6 +252,10 @@ struct llama_moe_stream {
     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
     void update_hotness_locked(llama_moe_stream_layer & sl); // bump touched experts, decay periodically
+
+    // hot host cache internals (all under mtx)
+    int32_t pick_host_victim_locked(llama_moe_stream_layer & sl) const;
+    void reserve_host_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
 
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
     void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
