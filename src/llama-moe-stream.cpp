@@ -1745,6 +1745,12 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
     GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(a));
     GGML_ASSERT(dst->data != a->data); // the emit must not clobber the ids the other waves read
 
+    // wave order and previous-wave completion: the graph appends a 1-element view of the previous
+    //   wave's output to src[1], so MUL_MAT_ID runs only after this op and this op only after the
+    //   previous wave's GEMMs have finished reading their slots (GGML_OP_CUSTOM is atomic to the
+    //   scheduler, and the view pins the previous wave's allocation for the whole graph)
+    GGML_ASSERT(w == 0 || dst->src[1] != nullptr);
+
     const int64_t   n   = ggml_nelements(a);
     const int32_t * ids = (const int32_t *) a->data;
           int32_t * out = (int32_t *) dst->data;
