@@ -24,6 +24,7 @@ struct llama_prec_policy;
 struct llama_hadamard;
 
 class llama_moe_cache;
+struct llama_moe_stream;
 
 struct llama_memory_context_i;
 
@@ -872,6 +873,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    llama_moe_stream             * mstream;
 
     ggml_tensor * layer_inp_dev = nullptr; // own layer input device buffer (write)
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
@@ -1146,6 +1148,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    llama_moe_stream             * mstream;
 
     const llama_hadamard * hdmd;
 

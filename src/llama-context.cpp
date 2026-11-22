@@ -10,6 +10,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-stream.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -350,6 +351,30 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // MoE expert streaming: the expert cache must hold every distinct expert of one ubatch. In the
+    // worst case that is n_tokens * n_expert_used, so cap n_ubatch to keep any routing within the
+    // cache (this iteration has no multi-wave prefill; streaming still sees full-size outputs).
+    if (model.moe_stream() != nullptr) {
+        if (!cparams.causal_attn) {
+            throw std::runtime_error("MoE expert streaming is not supported with non-causal attention (encoders/embeddings)");
+        }
+
+        const uint32_t n_slots       = model.moe_stream()->n_slots;
+        const uint32_t n_expert_used = std::max<uint32_t>(model.hparams.n_expert_used_max(), 1);
+        const uint32_t n_ubatch_max  = std::max<uint32_t>(n_slots / n_expert_used, 1);
+
+        if (cparams.n_seq_max > n_ubatch_max) {
+            throw std::runtime_error(format("%s: MoE expert streaming has %u slots per layer, enough for %u token(s) per ubatch, but n_seq_max = %u; increase --moe-stream-cache",
+                    __func__, n_slots, n_ubatch_max, cparams.n_seq_max));
+        }
+
+        if (cparams.n_ubatch > n_ubatch_max) {
+            LLAMA_LOG_INFO("%s: capping n_ubatch from %u to %u for MoE expert streaming (%u slots, %u experts per token)\n",
+                    __func__, cparams.n_ubatch, n_ubatch_max, n_slots, n_expert_used);
+            cparams.n_ubatch = n_ubatch_max;
+        }
+    }
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
@@ -623,6 +648,9 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
+            if (model.moe_stream() != nullptr) {
+                throw std::runtime_error("the MoE cache (--moe-cache-mib) and MoE expert streaming (--moe-stream) cannot be used together");
+            }
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
 
@@ -3072,6 +3100,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.mstream     =*/ model.moe_stream(),
         /*.layer_inp_dev =*/ layer_inp_dev,
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
@@ -4843,6 +4872,15 @@ int32_t llama_set_adapters_lora(
             float * scales) {
     if (adapters == nullptr || scales == nullptr) {
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
+    }
+
+    if (ctx->get_model().moe_stream() != nullptr) {
+        for (size_t i = 0; i < n_adapters; i++) {
+            if (scales[i] != 0.0f) {
+                LLAMA_LOG_ERROR("%s: LoRA adapters are not supported with MoE expert streaming\n", __func__);
+                return -1;
+            }
+        }
     }
 
     ctx->set_adapters_lora(adapters, n_adapters, scales);
