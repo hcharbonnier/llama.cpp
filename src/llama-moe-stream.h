@@ -34,6 +34,7 @@
 // one context can evict slots referenced by the other's in-flight graph.
 
 struct llama_moe_stream;
+struct llama_moe_stream_layer;
 
 enum llama_moe_stream_slot_state : uint8_t {
     LLAMA_MOE_STREAM_SLOT_EMPTY    = 0,
@@ -54,6 +55,12 @@ struct llama_moe_stream_weight {
     uint32_t        host_last  = 0;       // one past the last mirrored expert id
 
     uint8_t * host_cache = nullptr; // hot policy: host cache base, n_host_slots slabs of this weight
+};
+
+// userdata of one wave's custom op (multi-pass prefill)
+struct llama_moe_stream_wave {
+    llama_moe_stream_layer * sl   = nullptr;
+    int32_t                  wave = -1;
 };
 
 // per-layer streaming state - also the userdata of the id-remapping custom op
@@ -92,6 +99,16 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t> touched;
     std::vector<uint8_t> keep;         // [n_slots] slots the current call must not evict
     std::vector<int32_t> demand_slots; // slots the current call waits on
+
+    // wave plan for multi-pass prefill (guarded by mgr->mtx): the touched experts are split into
+    // consecutive passes of at most plan_capacity experts each, run one pass at a time
+    uint32_t plan_capacity  = 0;  // experts per wave, set at graph build
+    int32_t  plan_next_wave = -1; // wave expected to run next (ordering guard)
+    std::vector<uint8_t> expert_wave; // [n_expert] wave of each touched expert, 0xff = untouched
+    std::vector<std::unique_ptr<llama_moe_stream_wave>> wave_ud; // stable per-wave userdata
+
+    // stable userdata for wave w (grows lazily); called at graph build time only
+    llama_moe_stream_wave * wave_userdata(int32_t wave, uint32_t capacity);
 
     // whether the exps tensors passed to build_moe_ffn are this layer's cache tensors
     // (e.g. grovemoe evaluates a second, unstreamed expert group on the same layer index)
@@ -212,6 +229,12 @@ struct llama_moe_stream {
         int64_t n_host_evictions  = 0; // hot policy: resident host slots reused for another expert
         int64_t n_host_insertions = 0; // hot policy: slabs published into the host cache
         int64_t t_host_insert_us  = 0; // hot policy: time spent copying slabs into the host cache
+
+        int64_t n_wave_calls       = 0; // wave ids ops run (multi-pass prefill)
+        int64_t n_waves_run        = 0; // non-empty waves staged
+        int64_t n_preload_issued   = 0; // next-wave loads queued ahead of time
+        int64_t n_preload_ready    = 0; // experts already resident when their wave started
+        int64_t t_stall_wave_us    = 0; // wait time in wave staging
     } stats;
 
     // internals
@@ -221,6 +244,13 @@ struct llama_moe_stream {
     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
     void update_hotness_locked(llama_moe_stream_layer & sl); // bump touched experts, decay periodically
 
+    // multi-pass prefill internals (all under mtx)
+    void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n);
+    void stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl,
+            int32_t wave, bool host_admit);
+    void emit_wave_slots(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out,
+            int32_t wave, uint32_t n_ids, int64_t n_tok);
+
     // hot host cache internals (all under mtx)
     int32_t pick_host_victim_locked(llama_moe_stream_layer & sl) const;
     void reserve_host_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
@@ -228,3 +258,6 @@ struct llama_moe_stream {
 
 // callback of the id-remapping custom op inserted by build_moe_ffn
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+
+// callback of one wave's id-remapping custom op (multi-pass prefill)
+void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userdata);
