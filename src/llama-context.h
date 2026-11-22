@@ -336,6 +336,15 @@ private:
 
     const llama_model & model;
 
+    // holds the single-context claim of a streamed model; released on destruction, including
+    // when the constructor throws before the claim is committed
+    struct moe_stream_guard {
+        llama_moe_stream * ms = nullptr;
+
+        ~moe_stream_guard();
+    };
+    moe_stream_guard mstream_guard;
+
     llama_cparams cparams;
 
     llama_adapter_cvec_ptr  cvec;

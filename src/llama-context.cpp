@@ -161,6 +161,12 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+llama_context::moe_stream_guard::~moe_stream_guard() {
+    if (ms != nullptr) {
+        ms->remove_context();
+    }
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -173,6 +179,20 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    // a streamed model shares one expert cache across its contexts; eviction in one context would
+    // corrupt the in-flight graph of another, so reject a second concurrent context here
+    if (model.moe_stream() != nullptr) {
+        llama_moe_stream * ms = model.moe_stream();
+        const uint32_t n_prev = ms->add_context();
+        if (n_prev != 0) {
+            throw std::runtime_error(format(
+                    "MoE expert streaming: model '%s' already has %u active context(s), "
+                    "only one context per streamed model is supported",
+                    model.arch_name().c_str(), n_prev));
+        }
+        mstream_guard.ms = ms;
+    }
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;

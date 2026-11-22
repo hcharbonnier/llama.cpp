@@ -24,8 +24,9 @@
 // selected, so streaming affects latency, not outputs.
 //
 // Missing experts are loaded by a pool of I/O threads while the remap op waits; eviction is by
-// decaying route hotness with an LRU tiebreak. Reads are buffered by default, or O_DIRECT with
-// --moe-stream-direct (bypasses the page cache; recommended when the model far exceeds RAM).
+// decaying route hotness with an LRU tiebreak. Reads are buffered by default, or unbuffered with
+// --moe-stream-direct (O_DIRECT on POSIX, FILE_FLAG_NO_BUFFERING on Windows; bypasses the page
+// cache; recommended when the model far exceeds RAM).
 //
 // --moe-stream-ram mirrors an even share of each streamed layer in host memory, pinned when the
 // device exposes it. The device cache is dynamic, so the mirror may also hold resident experts.
@@ -172,7 +173,24 @@ struct llama_moe_stream {
     // print the streaming counters
     void print_stats() const;
 
-    bool use_direct_io = false; // O_DIRECT streaming reads (--moe-stream-direct), no page cache
+    // a streamed model shares one expert cache across all its contexts, so only one context may
+    // use it at a time. add_context returns 0 on success, else the number of contexts active.
+    uint32_t add_context() {
+        std::lock_guard<std::mutex> lock(ctx_mtx);
+        const uint32_t n_prev = n_ctx;
+        if (n_prev == 0) {
+            n_ctx = 1;
+        }
+        return n_prev;
+    }
+
+    void remove_context() {
+        std::lock_guard<std::mutex> lock(ctx_mtx);
+        GGML_ASSERT(n_ctx > 0);
+        n_ctx--;
+    }
+
+    bool use_direct_io = false; // unbuffered streaming reads (--moe-stream-direct), no page cache
 
     uint64_t ram_budget  = 0; // host RAM tier budget in bytes
     bool     ram_auto    = false; // derive ram_budget from available physical RAM at load
@@ -197,6 +215,10 @@ struct llama_moe_stream {
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context_ptr>> ctxs; // one per buft
     std::vector<ggml_backend_buffer_ptr> bufs;
     bool no_alloc = false; // dummy buffers were attached, buffer sizes are only projected
+
+    // single-context claim: guards against concurrent contexts sharing this expert cache
+    std::mutex ctx_mtx;
+    uint32_t   n_ctx = 0; // active contexts, guarded by ctx_mtx
 
     // load pool (queue and all layer residency state guarded by mtx)
     mutable std::mutex      mtx;
