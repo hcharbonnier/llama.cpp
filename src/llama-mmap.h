@@ -25,6 +25,8 @@ struct llama_file {
     size_t tell() const;
     size_t size() const;
 
+    const char * path() const; // file name, or "(file*)" for an opened stream
+
     int file_id() const; // fileno overload
 
     void seek(size_t offset, int whence) const;
