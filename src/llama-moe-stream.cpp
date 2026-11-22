@@ -697,13 +697,16 @@ void llama_moe_stream::setup_host_cache() {
         return;
     }
 
+    // hot mode does not allocate the static mirror (an expert lives in one tier only), so the
+    // static share subtracted from the budget is zero and the whole budget feeds the hot tier
     const uint64_t budget_per_layer = ram_budget / n_mirror_layers;
     const int64_t  t_start          = ggml_time_us();
 
-    uint32_t n_layers    = 0;
-    uint32_t n_slots_max = 0;
-    size_t   n_allocated = 0;
-    bool     pinned      = true;
+    uint32_t n_layers      = 0;
+    uint32_t n_full_layers = 0;
+    uint32_t n_slots_max   = 0;
+    size_t   n_allocated   = 0;
+    bool     pinned        = true;
 
     // drop every host cache reference before an error unwinds, so no partial tier stays visible
     auto disable = [&]() {
@@ -742,6 +745,12 @@ void llama_moe_stream::setup_host_cache() {
                     "MoE expert streaming: host cache budget %.2f GiB cannot hold one expert per layer "
                     "(layer %d needs %.2f MiB); raise --moe-stream-ram",
                     ram_budget / 1024.0 / 1024.0 / 1024.0, sl.il, nb_expert / 1024.0 / 1024.0));
+        }
+        if (n_host_expert >= n_expert) {
+            // this budget would already mirror every expert of this layer: a dynamic tier there
+            // can only add indirection, so keep the layer on the device cache and its file reads
+            n_full_layers++;
+            continue;
         }
         if (nb_expert > SIZE_MAX / n_host_expert) {
             disable();
@@ -806,6 +815,19 @@ void llama_moe_stream::setup_host_cache() {
         n_layers++;
     }
 
+    if (n_layers == 0) {
+        disable();
+        throw std::runtime_error(format(
+                "MoE expert streaming: --moe-stream-ram-policy hot adds nothing here: the %.2f GiB budget "
+                "would already mirror every expert of all %u streamed layers; use the default static policy "
+                "or lower --moe-stream-ram",
+                ram_budget / 1024.0 / 1024.0 / 1024.0, n_mirror_layers));
+    }
+    if (n_full_layers > 0) {
+        LLAMA_LOG_WARN("%s: host cache budget already covers every expert of %u layer(s), hot tier disabled there\n",
+                __func__, n_full_layers);
+    }
+
     LLAMA_LOG_INFO("%s: dynamic host cache = %.2f GiB over %u layers, up to %u slots per layer (%s, %.2f s)\n",
             __func__, n_allocated / 1024.0 / 1024.0 / 1024.0, n_layers, n_slots_max,
             pinned ? "pinned" : "pageable", (ggml_time_us() - t_start)/1e6);
@@ -818,7 +840,7 @@ void llama_moe_stream::fill_host_cache_seed() {
         return;
     }
     if (host_bufs.empty()) {
-        LLAMA_LOG_WARN("%s: host cache is not available, nothing to seed\n", __func__);
+        LLAMA_LOG_DEBUG("%s: host cache is not available, nothing to seed\n", __func__);
         return;
     }
 
@@ -946,6 +968,7 @@ void llama_moe_stream::fill_host_cache_seed() {
             sl.host_slot_gen[s]      = 1;
             sl.host_slot_last_use[s] = ++sl.host_use_counter;
             sl.expert_host_slot[e]   = (int32_t) s;
+            stats.n_host_seeds++;
         }
     }
 
@@ -1373,13 +1396,16 @@ void llama_moe_stream::print_stats() const {
             __func__, stats.n_dev_miss, n_loads, stats.t_stall_us/1000.0, n_calls > 0 ? stats.t_stall_us/1000.0/n_calls : 0.0);
 
     // hot policy: one host lookup per committed load, so host hits + host misses == ram hits + ram
-    // misses. No static mirror is allocated in this mode, so host misses are disk loads.
+    // misses == device misses. No static mirror is allocated in this mode, so host misses are disk
+    // loads, host insertions count only runtime slabs (seeds are reported separately) and host
+    // evictions never exceed host insertions + seeded slots. A disabled layer counts every load as
+    // a miss.
     if (ram_hot) {
         const int64_t n_lookups = stats.n_host_hit + stats.n_host_miss;
-        LLAMA_LOG_INFO("%s: moe stream: host hits = %" PRId64 ", host misses = %" PRId64 ", host hit rate = %.2f%%, host evictions = %" PRId64 ", host insertions = %" PRId64 "\n",
+        LLAMA_LOG_INFO("%s: moe stream: host hits = %" PRId64 ", host misses = %" PRId64 ", host hit rate = %.2f%%, host seeds = %" PRId64 ", host evictions = %" PRId64 ", host insertions = %" PRId64 "\n",
                 __func__, stats.n_host_hit, stats.n_host_miss,
                 n_lookups > 0 ? 100.0*stats.n_host_hit/n_lookups : 0.0,
-                stats.n_host_evictions, stats.n_host_insertions);
+                stats.n_host_seeds, stats.n_host_evictions, stats.n_host_insertions);
         LLAMA_LOG_INFO("%s: moe stream: host insertion = %.2f ms total\n",
                 __func__, stats.t_host_insert_us/1000.0);
     }

@@ -146,8 +146,8 @@ struct llama_moe_stream {
     // hot-seeded policy: fill the dynamic cache with the static mirror content at load time
     void fill_host_cache_seed();
 
-    // mark multi-token decode calls (prompt evaluation) for prefill admission
-    void set_prefill(bool active) { prefill_active.store(active, std::memory_order_relaxed); }
+    // mark multi-token decode calls (prompt evaluation) and return the previous state
+    bool set_prefill(bool active) { return prefill_active.exchange(active, std::memory_order_relaxed); }
 
     // memory the cache buffers use, per buffer type; with no_alloc this is the projected size
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
@@ -208,6 +208,7 @@ struct llama_moe_stream {
 
         int64_t n_host_hit        = 0; // hot policy: loads served by the host cache
         int64_t n_host_miss       = 0; // hot policy: host lookups that read the file
+        int64_t n_host_seeds      = 0; // hot policy: slabs published at load time by hot-seeded mode
         int64_t n_host_evictions  = 0; // hot policy: resident host slots reused for another expert
         int64_t n_host_insertions = 0; // hot policy: slabs published into the host cache
         int64_t t_host_insert_us  = 0; // hot policy: time spent copying slabs into the host cache
