@@ -97,9 +97,8 @@ struct llama_moe_stream {
     llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct);
     ~llama_moe_stream();
 
-    llama_moe_stream_layer * layer(int32_t il) const {
-        return il >= 0 && (size_t) il < layers.size() ? layers[il].get() : nullptr;
-    }
+    llama_moe_stream_layer * find_layer(const ggml_tensor * gate, const ggml_tensor * up,
+                                        const ggml_tensor * down, const ggml_tensor * gate_up) const;
 
     // registers a streamed weight of layer il and returns its cache tensor
     ggml_tensor * create_cache_tensor(
