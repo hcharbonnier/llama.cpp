@@ -26,9 +26,8 @@
 // decaying route hotness with an LRU tiebreak. Reads are buffered by default, or O_DIRECT with
 // --moe-stream-direct (bypasses the page cache; recommended when the model far exceeds RAM).
 //
-// --moe-stream-ram keeps a static host mirror of an even share of every streamed layer, so the
-// device misses of those experts are a PCIe copy instead of a file read. The mirror uses pinned
-// host memory when the device exposes it, pageable host memory otherwise.
+// --moe-stream-ram mirrors an even share of each streamed layer in host memory, pinned when the
+// device exposes it. The device cache is dynamic, so the mirror may also hold resident experts.
 //
 // note: multiple contexts decoding the same streamed model concurrently are not supported -
 // one context can evict slots referenced by the other's in-flight graph.
@@ -129,13 +128,13 @@ struct llama_moe_stream {
     // memory the cache buffers use, per buffer type; with no_alloc this is the projected size
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
-    // print the streaming counters (no-op callers check for streaming first)
+    // print the streaming counters
     void print_stats() const;
 
     bool use_direct_io = false; // O_DIRECT streaming reads (--moe-stream-direct), no page cache
 
-    size_t ram_budget = 0; // static host mirror budget in bytes
-    bool   ram_auto   = false; // derive ram_budget from available physical RAM at load
+    uint64_t ram_budget = 0; // static host mirror budget in bytes
+    bool     ram_auto   = false; // derive ram_budget from available physical RAM at load
     std::vector<ggml_backend_buffer_ptr> host_bufs;
 
     llama_files files; // privately opened GGUF files, same indices as the loader's
@@ -167,12 +166,13 @@ struct llama_moe_stream {
     bool debug = false;
     bool trace = false; // LLAMA_MOE_STREAM_TRACE: log one line per remap call
 
-    // counters, guarded by mtx
+    // counters, guarded by mtx: every touched expert is a device hit or miss, and every committed
+    // load is a ram hit or a disk (ram miss) load
     struct {
-        int64_t n_hit       = 0; // touched experts already resident or loading
-        int64_t n_miss      = 0; // demand loads issued
-        int64_t n_load_ram  = 0; // expert loads served by the host mirror
-        int64_t n_load_disk = 0; // expert loads read from the model file
+        int64_t n_dev_hit   = 0; // touched experts already resident or loading
+        int64_t n_dev_miss  = 0; // demand loads issued
+        int64_t n_ram_hit   = 0; // loads served by the host mirror
+        int64_t n_ram_miss  = 0; // loads read from the model file
         int64_t n_evictions = 0; // cache slots reused for another expert
         int64_t t_stall_us  = 0; // wait time in miss handling
     } stats;
