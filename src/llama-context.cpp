@@ -2254,6 +2254,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    // MoE expert streaming: the hot host cache only admits during prompt evaluation when the
+    // prefill flag is set; a multi-token decode call is how prompt evaluation reaches this path
+    struct moe_stream_prefill_guard {
+        llama_moe_stream * ms;
+        bool prev;
+
+        moe_stream_prefill_guard(llama_moe_stream * ms, bool active) : ms(ms), prev(false) {
+            if (ms != nullptr) {
+                prev = ms->prefill_active.exchange(active);
+            }
+        }
+        ~moe_stream_prefill_guard() {
+            if (ms != nullptr) {
+                ms->prefill_active.store(prev);
+            }
+        }
+    } prefill_guard(model.moe_stream(), n_tokens_all > 1);
+
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
     if (!embd_seq.empty()) {
