@@ -4,6 +4,7 @@
 
 #include "ggml-cpp.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -51,6 +52,8 @@ struct llama_moe_stream_weight {
     const uint8_t * host       = nullptr; // static host mirror of a contiguous range of experts
     uint32_t        host_first = 0;       // first mirrored expert id
     uint32_t        host_last  = 0;       // one past the last mirrored expert id
+
+    uint8_t * host_cache = nullptr; // hot policy: host cache base, n_host_slots slabs of this weight
 };
 
 // per-layer streaming state - also the userdata of the id-remapping custom op
@@ -74,6 +77,16 @@ struct llama_moe_stream_layer {
     std::vector<uint32_t> route_hotness; // [n_expert] decayed selection counts, for eviction
     int64_t use_counter = 0;
 
+    // hot host cache, guarded by mgr->mtx: n_host_slots slabs filled on admitted device misses
+    uint32_t              n_host_slots = 0;
+    std::vector<int32_t>  host_slot_expert;   // [n_host_slots] expert id or -1
+    std::vector<uint8_t>  host_slot_state;    // [n_host_slots] llama_moe_stream_slot_state
+    std::vector<uint32_t> host_slot_ref;      // [n_host_slots] claimed readers/writers, never evicted
+    std::vector<uint64_t> host_slot_gen;      // [n_host_slots] reservation generation
+    std::vector<int64_t>  host_slot_last_use; // [n_host_slots] LRU stamps
+    std::vector<int32_t>  expert_host_slot;   // [n_expert] host slot, -1 if absent
+    int64_t host_use_counter = 0;
+
     // scratch for the remap callback
     std::vector<int32_t> uniq;
     std::vector<uint8_t> touched;
@@ -93,6 +106,8 @@ struct llama_moe_stream_work {
     int32_t  expert = -1;
     int32_t  slot   = -1;
     uint64_t gen    = 0; // stale unless it matches slot_gen[slot]
+
+    bool     admit  = false; // hot policy: allow host insertion
 };
 
 struct llama_moe_stream {
@@ -102,7 +117,7 @@ struct llama_moe_stream {
     std::vector<std::unique_ptr<llama_moe_stream_layer>> layers; // [n_layer], null = not streamed
 
     llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct,
-            uint64_t ram_budget, bool ram_auto);
+            uint64_t ram_budget, bool ram_auto, bool ram_hot, bool ram_seed, bool ram_prefill);
     ~llama_moe_stream();
 
     llama_moe_stream_layer * find_layer(const ggml_tensor * gate, const ggml_tensor * up,
@@ -125,6 +140,15 @@ struct llama_moe_stream {
     // fill the static host mirror with an even share of the experts of every streamed layer
     void fill_host_mirror();
 
+    // allocate the dynamic host cache (hot policy), empty at load time
+    void setup_host_cache();
+
+    // hot-seeded policy: fill the dynamic cache with the static mirror content at load time
+    void fill_host_cache_seed();
+
+    // mark multi-token decode calls (prompt evaluation) for prefill admission
+    void set_prefill(bool active) { prefill_active.store(active, std::memory_order_relaxed); }
+
     // memory the cache buffers use, per buffer type; with no_alloc this is the projected size
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -133,8 +157,12 @@ struct llama_moe_stream {
 
     bool use_direct_io = false; // O_DIRECT streaming reads (--moe-stream-direct), no page cache
 
-    uint64_t ram_budget = 0; // static host mirror budget in bytes
-    bool     ram_auto   = false; // derive ram_budget from available physical RAM at load
+    uint64_t ram_budget  = 0; // host RAM tier budget in bytes
+    bool     ram_auto    = false; // derive ram_budget from available physical RAM at load
+    bool     ram_hot     = false; // --moe-stream-ram-policy hot: dynamic host cache, not a static mirror
+    bool     ram_seed    = false; // hot-seeded: start from the static mirror content
+    bool     ram_prefill = false; // --moe-stream-ram-prefill: admit during prompt evaluation too
+    std::atomic<bool> prefill_active{false}; // set by the context around multi-token decode calls
     std::vector<ggml_backend_buffer_ptr> host_bufs;
 
     llama_files files; // privately opened GGUF files, same indices as the loader's
@@ -144,8 +172,10 @@ struct llama_moe_stream {
     std::vector<std::string> file_paths;
 
     size_t  max_nb_expert      = 0;
+    uint32_t max_n_expert      = 0;
     int64_t hot_decay_interval = 0; // stream calls between route-hotness halvings (0 = no decay)
     int64_t n_calls            = 0;
+    std::vector<int64_t> last_host_miss; // [n_expert] remap call of the last missed load, hot policy
 
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context_ptr>> ctxs; // one per buft
     std::vector<ggml_backend_buffer_ptr> bufs;
@@ -175,6 +205,12 @@ struct llama_moe_stream {
         int64_t n_ram_miss  = 0; // loads read from the model file
         int64_t n_evictions = 0; // cache slots reused for another expert
         int64_t t_stall_us  = 0; // wait time in miss handling
+
+        int64_t n_host_hit        = 0; // hot policy: loads served by the host cache
+        int64_t n_host_miss       = 0; // hot policy: host lookups that read the file
+        int64_t n_host_evictions  = 0; // hot policy: resident host slots reused for another expert
+        int64_t n_host_insertions = 0; // hot policy: slabs published into the host cache
+        int64_t t_host_insert_us  = 0; // hot policy: time spent copying slabs into the host cache
     } stats;
 
     // internals
@@ -183,6 +219,10 @@ struct llama_moe_stream {
     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
     void update_hotness_locked(llama_moe_stream_layer & sl); // bump touched experts, decay periodically
+
+    // hot host cache internals (all under mtx)
+    int32_t pick_host_victim_locked(llama_moe_stream_layer & sl) const;
+    void reserve_host_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
 };
 
 // callback of the id-remapping custom op inserted by build_moe_ffn

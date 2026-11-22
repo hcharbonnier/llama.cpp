@@ -904,6 +904,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         if (!params.lora_adapters.empty()) {
             throw std::invalid_argument("error: --moe-stream does not support --lora adapters\n");
         }
+        if (params.moe_stream_ram_prefill && !params.moe_stream_ram_hot) {
+            throw std::invalid_argument("error: --moe-stream-ram-prefill requires --moe-stream-ram-policy hot or hot-seeded\n");
+        }
+        if (params.moe_stream_ram_hot && params.moe_stream_ram == 0 && !params.moe_stream_ram_auto) {
+            throw std::invalid_argument("error: --moe-stream-ram-policy hot requires --moe-stream-ram N|auto\n");
+        }
     }
 
     postprocess_cpu_params(params.cpuparams,       nullptr);
@@ -2847,9 +2853,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_STREAM_DIRECT"));
     add_opt(common_arg(
         {"--moe-stream-ram"}, "N[K|M|G]|auto",
-        "static host mirror for --moe-stream: memory budget holding the experts the device cache does not keep, "
-        "so their misses cross PCIe instead of reading the model file, or 'auto' for half of the available physical RAM; "
-        "implies --moe-stream (default: 0, disabled)",
+        "host RAM tier for --moe-stream: memory budget holding the experts the device cache does not keep, "
+        "as a static mirror by default or as a dynamic cache with --moe-stream-ram-policy hot; 'auto' uses "
+        "half of the available physical RAM; implies --moe-stream (default: 0, disabled)",
         [](common_params & params, const std::string & value) {
             params.moe_stream = true;
             if (value == "auto") {
@@ -2890,28 +2896,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_stream_ram      = n*mult;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_RAM"));
-    // the hot policy, prefill admission and pinning are not part of this iteration:
-    // accept the flags so that startup fails with an explicit message instead of a no-op
+    // the hot policy and prefill admission are opt-in; pinning is not part of this iteration:
+    // accept the pin flag so that startup fails with an explicit message instead of a no-op
     {
         add_opt(common_arg(
             {"--moe-stream-ram-policy"}, "static|hot|hot-seeded",
-            "not implemented: host RAM tier policy for --moe-stream; fails at startup",
-            [](common_params &, const std::string &) {
-                throw std::invalid_argument("error: --moe-stream-ram-policy is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-ram, --moe-stream-io-threads, --moe-stream-direct");
+            "host RAM tier policy for --moe-stream: 'static' mirrors an even share of the experts (default), "
+            "'hot' keeps a dynamic cache filled on device misses, 'hot-seeded' starts that cache from the static "
+            "mirror content; hot policies require --moe-stream-ram",
+            [](common_params & params, const std::string & value) {
+                params.moe_stream = true;
+                if (value == "static") {
+                    params.moe_stream_ram_hot  = false;
+                    params.moe_stream_ram_seed = false;
+                } else if (value == "hot") {
+                    params.moe_stream_ram_hot  = true;
+                    params.moe_stream_ram_seed = false;
+                } else if (value == "hot-seeded") {
+                    params.moe_stream_ram_hot  = true;
+                    params.moe_stream_ram_seed = true;
+                } else {
+                    throw std::invalid_argument("invalid value, expected static, hot or hot-seeded");
+                }
             }
         ).set_env("LLAMA_ARG_MOE_STREAM_RAM_POLICY"));
         add_opt(common_arg(
             {"--moe-stream-ram-prefill"},
-            "not implemented: host RAM tier admission during prefill for --moe-stream; fails at startup",
-            [](common_params &) {
-                throw std::invalid_argument("error: --moe-stream-ram-prefill is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-ram, --moe-stream-io-threads, --moe-stream-direct");
+            "admit experts into the --moe-stream hot host cache during prompt evaluation; "
+            "requires --moe-stream-ram-policy hot or hot-seeded",
+            [](common_params & params) {
+                params.moe_stream = true;
+                params.moe_stream_ram_prefill = true;
             }
         ).set_env("LLAMA_ARG_MOE_STREAM_RAM_PREFILL"));
         add_opt(common_arg(
             {"--moe-stream-pin"}, "N",
             "not implemented: permanently resident experts for --moe-stream; fails at startup",
             [](common_params &, int) {
-                throw std::invalid_argument("error: --moe-stream-pin is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-ram, --moe-stream-io-threads, --moe-stream-direct");
+                throw std::invalid_argument("error: --moe-stream-pin is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-ram, --moe-stream-ram-policy, --moe-stream-ram-prefill, --moe-stream-io-threads, --moe-stream-direct");
             }
         ).set_env("LLAMA_ARG_MOE_STREAM_PIN"));
     }
