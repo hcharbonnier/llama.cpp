@@ -896,6 +896,16 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
+    // reject incompatible options before any model download or allocation
+    if (params.moe_stream) {
+        if (params.moe_cache_size > 0) {
+            throw std::invalid_argument("error: --moe-stream cannot be used with --moe-cache-mib\n");
+        }
+        if (!params.lora_adapters.empty()) {
+            throw std::invalid_argument("error: --moe-stream does not support --lora adapters\n");
+        }
+    }
+
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
@@ -2781,18 +2791,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "expert cache for --moe-stream: memory budget in GiB (e.g. 40) or exact slots per layer with an 's' suffix (e.g. 64s); implies --moe-stream (default: auto)",
         [](common_params & params, const std::string & value) {
             params.moe_stream = true;
+            if (value.empty() || value[0] == '-') {
+                throw std::invalid_argument("invalid value, expected <NG|Ns> (e.g. 40 or 64s)");
+            }
             size_t pos = 0;
-            const uint64_t n = std::stoull(value, &pos);
+            uint64_t n = 0;
+            try {
+                n = std::stoull(value, &pos);
+            } catch (const std::exception &) {
+                throw std::invalid_argument("invalid value, expected <NG|Ns> (e.g. 40 or 64s)");
+            }
             std::string suffix = value.substr(pos);
             for (auto & c : suffix) {
                 c = std::tolower(c);
             }
+            if (n == 0 || pos == 0) {
+                throw std::invalid_argument("invalid value, cache size must be greater than 0");
+            }
             if (suffix == "s" || suffix == "slot" || suffix == "slots") {
-                params.moe_stream_slots = n;
+                if (n > 0xffffffffull) {
+                    throw std::invalid_argument("invalid value, too many slots per layer");
+                }
+                params.moe_stream_slots  = (uint32_t) n;
+                params.moe_stream_budget = 0;
             } else if (suffix.empty() || suffix == "g" || suffix == "gb" || suffix == "gib") {
+                if (n > 0xffffffffffffffffull/1024ull/1024ull/1024ull) {
+                    throw std::invalid_argument("invalid value, budget is too large");
+                }
                 params.moe_stream_budget = n * 1024ull * 1024ull * 1024ull;
+                params.moe_stream_slots  = 0;
             } else {
-                throw std::invalid_argument("invalid value");
+                throw std::invalid_argument("invalid value, expected <NG|Ns> (e.g. 40 or 64s)");
             }
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_CACHE"));
@@ -2801,6 +2830,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "I/O threads for --moe-stream expert loads; implies --moe-stream (default: auto)",
         [](common_params & params, int value) {
             params.moe_stream = true;
+            if (value < 1 || value > 32) {
+                throw std::invalid_argument("invalid value, I/O threads must be between 1 and 32");
+            }
             params.moe_stream_io_threads = value;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_IO_THREADS"));
