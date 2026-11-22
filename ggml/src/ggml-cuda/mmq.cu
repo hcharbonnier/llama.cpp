@@ -335,6 +335,10 @@ void ggml_cuda_mul_mat_q(
     if (dedup_bcast) {
         // skipped slots keep -1 so the scatter kernels skip them
         cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream);
+    } else {
+        // only the first n_valid compact rows are written; point the tail at row 0 so the
+        // quantizer never reads an uninitialized index (the GEMM does not use those rows)
+        cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows*sizeof(int32_t), stream);
     }
 
     {
