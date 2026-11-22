@@ -281,8 +281,9 @@ extern "C" {
 
     // op hint
     enum ggml_op_hint {
-        GGML_HINT_NONE             = 0,
-        GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_NONE                      = 0,
+        GGML_HINT_SRC0_IS_HADAMARD          = 1,
+        GGML_HINT_MUL_MAT_ID_HAS_SKIPPED    = 2,
     };
 
     // model file types

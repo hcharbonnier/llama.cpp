@@ -2648,9 +2648,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
 
-    if (ids->ne[1] > 1) {
-        // multi-token MUL_MAT_ID may carry skipped slots (id -1, e.g. a MoE streaming prefill wave);
-        //   no GEMM path writes their dst rows, so zero them up front
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_MUL_MAT_ID_HAS_SKIPPED) {
+        // only the graph paths that mark it here can carry skipped slots (id -1, e.g. a MoE
+        //   streaming prefill wave); no GEMM path writes their dst rows, so zero them up front
         ggml_cuda_zero_skipped_mul_mat_id((const int32_t *) ids->data, (float *) dst->data,
             dst->ne[0], ids->ne[1], ids->ne[0],
             ids->nb[0]/ggml_element_size(ids), ids->nb[1]/ggml_element_size(ids),
