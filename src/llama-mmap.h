@@ -29,6 +29,9 @@ struct llama_file {
 
     int file_id() const; // fileno overload
 
+    // native unbuffered handle when the file was opened with direct I/O, nullptr otherwise
+    void * direct_handle() const;
+
     void seek(size_t offset, int whence) const;
 
     void read_raw(void * ptr, size_t len);

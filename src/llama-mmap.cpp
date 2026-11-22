@@ -390,6 +390,10 @@ struct llama_file::impl {
         return fp_win32_direct != INVALID_HANDLE_VALUE && alignment > 1;
     }
 
+    void * direct_handle() const {
+        return fp_win32_direct != INVALID_HANDLE_VALUE ? (void *) fp_win32_direct : nullptr;
+    }
+
     ~impl() {
         if (fp_win32_direct != INVALID_HANDLE_VALUE) {
             CloseHandle(fp_win32_direct);
@@ -617,6 +621,10 @@ struct llama_file::impl {
         return fd != -1 && alignment > 1;
     }
 
+    void * direct_handle() const {
+        return nullptr;
+    }
+
     ~impl() {
         if (fd != -1) {
             close(fd);
@@ -674,6 +682,8 @@ int llama_file::file_id() const {
 }
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
+
+void * llama_file::direct_handle() const { return pimpl->direct_handle(); }
 void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
 
