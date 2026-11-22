@@ -747,6 +747,10 @@ static __global__ void mul_mat_vec_q(
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
+    if (!shared_expert && ids != nullptr && (int32_t) channel_x < 0) {
+        return; // skipped slot, its dst row was zeroed up front
+    }
+
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
@@ -1023,7 +1027,11 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    const int32_t channel_x_i = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+    if (channel_x_i < 0) {
+        return; // skipped slot, its dst row was zeroed up front
+    }
+    const uint32_t channel_x = channel_x_i;
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;

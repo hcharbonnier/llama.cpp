@@ -79,6 +79,9 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         ids_src_compact_dev.alloc(ctx.pool(), ne_get_rows);
         ids_dst_compact_dev.alloc(ctx.pool(), ne_get_rows);
         tile_spec_dev.alloc(ctx.pool(), max_tiles);
+        // skipped slots leave the tail of the seam range unused; zeroing makes those tile specs
+        // empty so the kernel returns early instead of reading uninitialized specs
+        cudaMemsetAsync(tile_spec_dev.get(), 0, max_tiles*sizeof(ggml_cuda_mm_id_tile_spec), ctx.stream());
 
         const int si1  = static_cast<int>(ids_s1);
         const int sis1 = static_cast<int>(src1->nb[2] / src1->nb[1]);
@@ -89,7 +92,6 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), 16,
             si1, sis1, /*write_inverse =*/ false, ctx.stream());
         CUDA_CHECK(cudaGetLastError());
-
         ids_info.ids_src_compact = ids_src_compact_dev.get();
         ids_info.ids_dst_compact = ids_dst_compact_dev.get();
         ids_info.tile_spec_dev   = tile_spec_dev.get();

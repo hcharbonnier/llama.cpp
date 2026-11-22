@@ -324,10 +324,18 @@ void ggml_cuda_mul_mat_q(
 
     const int ntj = (ne_get_rows + J_best - 1) / J_best + ne02;
     ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), ntj);
+    // skipped slots leave the tail of the seam range unused; zeroing makes those tile specs
+    // empty so the kernel returns early instead of reading uninitialized specs
+    cudaMemsetAsync(tile_spec.get(), 0, ntj*sizeof(ggml_cuda_mm_id_tile_spec), stream);
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+
+    if (dedup_bcast) {
+        // skipped slots keep -1 so the scatter kernels skip them
+        cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream);
+    }
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
