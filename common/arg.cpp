@@ -2770,6 +2770,82 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
     add_opt(common_arg(
+        {"--moe-stream"},
+        "stream Mixture of Experts (MoE) routed expert weights from disk on demand",
+        [](common_params & params) {
+            params.moe_stream = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM"));
+    add_opt(common_arg(
+        {"--moe-stream-cache"}, "<NG|Ns>",
+        "expert cache for --moe-stream: memory budget in GiB (e.g. 40) or exact slots per layer with an 's' suffix (e.g. 64s); implies --moe-stream (default: auto)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream = true;
+            size_t pos = 0;
+            const uint64_t n = std::stoull(value, &pos);
+            std::string suffix = value.substr(pos);
+            for (auto & c : suffix) {
+                c = std::tolower(c);
+            }
+            if (suffix == "s" || suffix == "slot" || suffix == "slots") {
+                params.moe_stream_slots = n;
+            } else if (suffix.empty() || suffix == "g" || suffix == "gb" || suffix == "gib") {
+                params.moe_stream_budget = n * 1024ull * 1024ull * 1024ull;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_CACHE"));
+    add_opt(common_arg(
+        {"--moe-stream-io-threads"}, "N",
+        "I/O threads for --moe-stream expert loads; implies --moe-stream (default: auto)",
+        [](common_params & params, int value) {
+            params.moe_stream = true;
+            params.moe_stream_io_threads = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_IO_THREADS"));
+    add_opt(common_arg(
+        {"--moe-stream-direct"},
+        "use direct I/O for --moe-stream expert reads (bypass the page cache); implies --moe-stream. "
+        "falls back to buffered reads if direct I/O is unsupported by the OS or filesystem",
+        [](common_params & params) {
+            params.moe_stream = true;
+            params.moe_stream_direct = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_DIRECT"));
+    // the host RAM tiers, pinning and multi-wave prefill are not part of this iteration:
+    // accept the flags so that startup fails with an explicit message instead of a no-op
+    {
+        add_opt(common_arg(
+            {"--moe-stream-ram"}, "N|auto",
+            "not implemented: host RAM tier for --moe-stream; fails at startup",
+            [](common_params &, const std::string &) {
+                throw std::invalid_argument("error: --moe-stream-ram is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-io-threads, --moe-stream-direct");
+            }
+        ).set_env("LLAMA_ARG_MOE_STREAM_RAM"));
+        add_opt(common_arg(
+            {"--moe-stream-ram-policy"}, "static|hot|hot-seeded",
+            "not implemented: host RAM tier policy for --moe-stream; fails at startup",
+            [](common_params &, const std::string &) {
+                throw std::invalid_argument("error: --moe-stream-ram-policy is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-io-threads, --moe-stream-direct");
+            }
+        ).set_env("LLAMA_ARG_MOE_STREAM_RAM_POLICY"));
+        add_opt(common_arg(
+            {"--moe-stream-ram-prefill"},
+            "not implemented: host RAM tier admission during prefill for --moe-stream; fails at startup",
+            [](common_params &) {
+                throw std::invalid_argument("error: --moe-stream-ram-prefill is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-io-threads, --moe-stream-direct");
+            }
+        ).set_env("LLAMA_ARG_MOE_STREAM_RAM_PREFILL"));
+        add_opt(common_arg(
+            {"--moe-stream-pin"}, "N",
+            "not implemented: permanently resident experts for --moe-stream; fails at startup",
+            [](common_params &, int) {
+                throw std::invalid_argument("error: --moe-stream-pin is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-io-threads, --moe-stream-direct");
+            }
+        ).set_env("LLAMA_ARG_MOE_STREAM_PIN"));
+    }
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",
