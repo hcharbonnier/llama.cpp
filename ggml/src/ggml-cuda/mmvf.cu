@@ -48,6 +48,10 @@ static __global__ void mul_mat_vec_f(
         sample_dst = ids ? 0                                                   : blockIdx.z;
     }
 
+    if (ids != nullptr && channel_x < 0) {
+        return; // skipped slot, its dst row was zeroed up front
+    }
+
     const int sample_x    = fastdiv((uint32_t) sample_dst, sample_ratio);
     const int sample_y    = sample_dst;
 
