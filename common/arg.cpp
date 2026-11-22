@@ -2845,35 +2845,73 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_stream_direct = true;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_DIRECT"));
-    // the host RAM tiers, pinning and multi-wave prefill are not part of this iteration:
+    add_opt(common_arg(
+        {"--moe-stream-ram"}, "N[K|M|G]|auto",
+        "static host mirror for --moe-stream: memory budget holding the experts the device cache does not keep, "
+        "so their misses cross PCIe instead of reading the model file, or 'auto' for half of the available physical RAM; "
+        "implies --moe-stream (default: 0, disabled)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream = true;
+            if (value == "auto") {
+                params.moe_stream_ram_auto = true;
+                params.moe_stream_ram      = 0;
+                return;
+            }
+            if (value.empty() || value[0] == '-') {
+                throw std::invalid_argument("invalid value, expected N[K|M|G] or auto");
+            }
+            size_t pos = 0;
+            uint64_t n = 0;
+            try {
+                n = std::stoull(value, &pos);
+            } catch (const std::exception &) {
+                throw std::invalid_argument("invalid value, expected N[K|M|G] or auto");
+            }
+            std::string suffix = value.substr(pos);
+            for (auto & c : suffix) {
+                c = std::tolower(c);
+            }
+            uint64_t mult = 1;
+            if (suffix.empty() || suffix == "b") {
+                mult = 1;
+            } else if (suffix == "k" || suffix == "kb" || suffix == "kib") {
+                mult = 1024ull;
+            } else if (suffix == "m" || suffix == "mb" || suffix == "mib") {
+                mult = 1024ull*1024ull;
+            } else if (suffix == "g" || suffix == "gb" || suffix == "gib") {
+                mult = 1024ull*1024ull*1024ull;
+            } else {
+                throw std::invalid_argument("invalid value, expected N[K|M|G] or auto");
+            }
+            if (n > UINT64_MAX/mult) {
+                throw std::invalid_argument("invalid value, budget is too large");
+            }
+            params.moe_stream_ram_auto = false;
+            params.moe_stream_ram      = n*mult;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_RAM"));
+    // the hot policy, prefill admission and pinning are not part of this iteration:
     // accept the flags so that startup fails with an explicit message instead of a no-op
     {
-        add_opt(common_arg(
-            {"--moe-stream-ram"}, "N|auto",
-            "not implemented: host RAM tier for --moe-stream; fails at startup",
-            [](common_params &, const std::string &) {
-                throw std::invalid_argument("error: --moe-stream-ram is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-io-threads, --moe-stream-direct");
-            }
-        ).set_env("LLAMA_ARG_MOE_STREAM_RAM"));
         add_opt(common_arg(
             {"--moe-stream-ram-policy"}, "static|hot|hot-seeded",
             "not implemented: host RAM tier policy for --moe-stream; fails at startup",
             [](common_params &, const std::string &) {
-                throw std::invalid_argument("error: --moe-stream-ram-policy is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-io-threads, --moe-stream-direct");
+                throw std::invalid_argument("error: --moe-stream-ram-policy is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-ram, --moe-stream-io-threads, --moe-stream-direct");
             }
         ).set_env("LLAMA_ARG_MOE_STREAM_RAM_POLICY"));
         add_opt(common_arg(
             {"--moe-stream-ram-prefill"},
             "not implemented: host RAM tier admission during prefill for --moe-stream; fails at startup",
             [](common_params &) {
-                throw std::invalid_argument("error: --moe-stream-ram-prefill is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-io-threads, --moe-stream-direct");
+                throw std::invalid_argument("error: --moe-stream-ram-prefill is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-ram, --moe-stream-io-threads, --moe-stream-direct");
             }
         ).set_env("LLAMA_ARG_MOE_STREAM_RAM_PREFILL"));
         add_opt(common_arg(
             {"--moe-stream-pin"}, "N",
             "not implemented: permanently resident experts for --moe-stream; fails at startup",
             [](common_params &, int) {
-                throw std::invalid_argument("error: --moe-stream-pin is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-io-threads, --moe-stream-direct");
+                throw std::invalid_argument("error: --moe-stream-pin is not implemented in this build; supported: --moe-stream, --moe-stream-cache, --moe-stream-ram, --moe-stream-io-threads, --moe-stream-direct");
             }
         ).set_env("LLAMA_ARG_MOE_STREAM_PIN"));
     }

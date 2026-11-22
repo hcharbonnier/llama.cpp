@@ -623,6 +623,8 @@ struct common_params {
     uint32_t moe_stream_slots      = 0;     // expert cache slots per streamed layer (0 = auto)
     uint64_t moe_stream_budget     = 0;     // total expert cache byte budget, used when slots == 0 (0 = auto)
     int32_t  moe_stream_io_threads = 0;     // expert load I/O threads (<= 0 = default)
+    uint64_t moe_stream_ram        = 0;     // static host mirror byte budget for the experts the cache does not hold
+    bool     moe_stream_ram_auto   = false; // derive the host mirror budget from available physical RAM
     bool     moe_stream_direct     = false; // use direct I/O for expert reads (bypass page cache)
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;

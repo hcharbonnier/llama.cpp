@@ -1985,7 +1985,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (pimpl->has_tensor_overrides) {
                 LLAMA_LOG_WARN("%s: tensor buffer overrides (-ot/--cpu-moe) do not apply to streamed expert tensors\n", __func__);
             }
-            pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream_io_threads, params.moe_stream_direct);
+            pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream_io_threads, params.moe_stream_direct,
+                    params.moe_stream_ram, params.moe_stream_ram_auto);
             LLAMA_LOG_INFO("%s: MoE expert streaming enabled, %u of %u experts cached per layer, %d I/O threads\n",
                     __func__, n_slots, hparams.n_expert, pimpl->moe_stream->n_io_threads);
         }
@@ -2395,6 +2396,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 pimpl->moe_stream->open_files(paths);
                 pimpl->moe_stream->clamp_io_staging();
                 pimpl->moe_stream->alloc_bufs(false);
+                pimpl->moe_stream->fill_host_mirror();
             }
         }
     }
@@ -2907,6 +2909,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
 
 llama_moe_stream * llama_model::moe_stream() const {
     return pimpl->moe_stream.get();
+}
+
+void llama_moe_stream_print_stats(const llama_model * model) {
+    if (model && model->moe_stream()) {
+        model->moe_stream()->print_stats();
+    }
 }
 
 uint64_t llama_model::n_elements() const {
@@ -3920,6 +3928,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_slots            =*/ 0,
         /*.moe_stream_budget           =*/ 0,
         /*.moe_stream_io_threads       =*/ 0,
+        /*.moe_stream_ram              =*/ 0,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
@@ -3931,6 +3940,7 @@ llama_model_params llama_model_default_params() {
         /*.load_mtp                    =*/ false,
         /*.moe_stream                  =*/ false,
         /*.moe_stream_direct           =*/ false,
+        /*.moe_stream_ram_auto         =*/ false,
     };
 
     return result;
@@ -4399,6 +4409,10 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
 
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
+}
+
+bool llama_model_moe_stream_enabled(const struct llama_model * model) {
+    return model->moe_stream() != nullptr;
 }
 
 ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i) {

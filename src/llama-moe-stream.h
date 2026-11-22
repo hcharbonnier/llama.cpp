@@ -26,6 +26,10 @@
 // decaying route hotness with an LRU tiebreak. Reads are buffered by default, or O_DIRECT with
 // --moe-stream-direct (bypasses the page cache; recommended when the model far exceeds RAM).
 //
+// --moe-stream-ram keeps a static host mirror of an even share of every streamed layer, so the
+// device misses of those experts are a PCIe copy instead of a file read. The mirror uses pinned
+// host memory when the device exposes it, pageable host memory otherwise.
+//
 // note: multiple contexts decoding the same streamed model concurrently are not supported -
 // one context can evict slots referenced by the other's in-flight graph.
 
@@ -44,6 +48,10 @@ struct llama_moe_stream_weight {
     uint16_t file_idx  = 0; // GGUF split file index
     size_t   offs      = 0; // file offset of the full exps tensor data
     size_t   nb_expert = 0; // bytes per expert slab
+
+    const uint8_t * host       = nullptr; // static host mirror of a contiguous range of experts
+    uint32_t        host_first = 0;       // first mirrored expert id
+    uint32_t        host_last  = 0;       // one past the last mirrored expert id
 };
 
 // per-layer streaming state - also the userdata of the id-remapping custom op
@@ -94,7 +102,8 @@ struct llama_moe_stream {
 
     std::vector<std::unique_ptr<llama_moe_stream_layer>> layers; // [n_layer], null = not streamed
 
-    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct);
+    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct,
+            uint64_t ram_budget, bool ram_auto);
     ~llama_moe_stream();
 
     llama_moe_stream_layer * find_layer(const ggml_tensor * gate, const ggml_tensor * up,
@@ -114,10 +123,20 @@ struct llama_moe_stream {
     // open the GGUF files for streaming reads
     void open_files(const std::vector<std::string> & paths);
 
+    // fill the static host mirror with an even share of the experts of every streamed layer
+    void fill_host_mirror();
+
     // memory the cache buffers use, per buffer type; with no_alloc this is the projected size
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // print the streaming counters (no-op callers check for streaming first)
+    void print_stats() const;
+
     bool use_direct_io = false; // O_DIRECT streaming reads (--moe-stream-direct), no page cache
+
+    size_t ram_budget = 0; // static host mirror budget in bytes
+    bool   ram_auto   = false; // derive ram_budget from available physical RAM at load
+    std::vector<ggml_backend_buffer_ptr> host_bufs;
 
     llama_files files; // privately opened GGUF files, same indices as the loader's
 
@@ -146,6 +165,17 @@ struct llama_moe_stream {
     bool load_failed     = false;
 
     bool debug = false;
+    bool trace = false; // LLAMA_MOE_STREAM_TRACE: log one line per remap call
+
+    // counters, guarded by mtx
+    struct {
+        int64_t n_hit       = 0; // touched experts already resident or loading
+        int64_t n_miss      = 0; // demand loads issued
+        int64_t n_load_ram  = 0; // expert loads served by the host mirror
+        int64_t n_load_disk = 0; // expert loads read from the model file
+        int64_t n_evictions = 0; // cache slots reused for another expert
+        int64_t t_stall_us  = 0; // wait time in miss handling
+    } stats;
 
     // internals
     void start_workers_locked();
