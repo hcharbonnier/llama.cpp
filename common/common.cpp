@@ -1723,6 +1723,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    mparams.moe_stream                  = params.moe_stream;
+    mparams.moe_stream_slots            = params.moe_stream_slots;
+    mparams.moe_stream_budget           = params.moe_stream_budget;
+    mparams.moe_stream_io_threads       = params.moe_stream_io_threads;
+    mparams.moe_stream_direct           = params.moe_stream_direct;
 
     return mparams;
 }
