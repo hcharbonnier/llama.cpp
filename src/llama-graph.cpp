@@ -2390,6 +2390,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    // a streamed layer holds n_slots (< n_expert) expert slabs, so archs that infer n_expert from
+    // the exps tensor shape would see the cache size here; take the real count from the engine
+    llama_moe_stream_layer * msl = mstream == nullptr ? nullptr :
+        mstream->find_layer(gate_exps, up_exps, down_exps, gate_up_exps);
+    if (msl != nullptr) {
+        if (std::find(mstream_layers.begin(), mstream_layers.end(), msl) != mstream_layers.end()) {
+            GGML_ABORT("MoE expert streaming: layer %d is evaluated twice in one graph; "
+                       "two expert groups on one streamed layer are not supported", msl->il);
+        }
+        mstream_layers.push_back(msl);
+        n_expert = msl->n_expert;
+    }
+
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
@@ -2553,13 +2566,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // MoE expert streaming: make the selected experts cache-resident and remap the ids fed to the
     // expert GEMMs to cache slots; the routing (weights, scales, biases) keeps the original ids
     ggml_tensor * mm_ids = nullptr;
-    if (cache.slots == nullptr && mstream != nullptr) {
-        llama_moe_stream_layer * msl = mstream->layer(il);
-        if (msl != nullptr && msl->matches(gate_exps, up_exps, down_exps, gate_up_exps)) {
-            ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
-            mm_ids = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
-            cb(mm_ids, "ffn_moe_stream_slots", il);
-        }
+    if (cache.slots == nullptr && msl != nullptr) {
+        ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
+        mm_ids = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
+        cb(mm_ids, "ffn_moe_stream_slots", il);
     }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);

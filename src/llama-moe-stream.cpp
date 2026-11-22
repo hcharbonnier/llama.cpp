@@ -6,9 +6,8 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <filesystem>
 #include <stdexcept>
 
 #ifdef _WIN32
@@ -161,6 +160,46 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
     return n > 0 && n == weights.size();
 }
 
+// map the exps tensors of one build_moe_ffn call to their streamed layer. looking at the pointers
+// instead of the layer index also covers archs that evaluate several expert groups on one layer
+// index, and archs that pass a different bid to the graph. a mix of streamed and non-streamed
+// weights cannot be remapped safely, so abort instead of using expert ids on a resized cache.
+llama_moe_stream_layer * llama_moe_stream::find_layer(
+        const ggml_tensor * gate, const ggml_tensor * up,
+        const ggml_tensor * down, const ggml_tensor * gate_up) const {
+    size_t n_cached = 0;
+    for (const ggml_tensor * t : { gate, up, down, gate_up }) {
+        if (t == nullptr) {
+            continue;
+        }
+        for (const auto & sl : layers) {
+            if (!sl) {
+                continue;
+            }
+            for (const auto & wt : sl->weights) {
+                if (wt.cache == t) {
+                    n_cached++;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (n_cached == 0) {
+        return nullptr;
+    }
+
+    for (const auto & sl : layers) {
+        if (sl && sl->matches(gate, up, down, gate_up)) {
+            return sl.get();
+        }
+    }
+
+    GGML_ABORT("MoE expert streaming: build_moe_ffn got a mix of streamed and non-streamed expert tensors "
+               "(unsupported expert group or layer mapping)");
+    return nullptr;
+}
+
 // sizes the per-layer table and clamps the I/O thread count; workers are spawned lazily on first use
 llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct)
         : n_slots(n_slots) {
@@ -304,6 +343,11 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
     for (const auto & path : paths) {
         if (path.empty() || path[0] == '(') {
             throw std::runtime_error("MoE expert streaming requires a file-based model (not a stream/file descriptor)");
+        }
+        std::error_code ec;
+        const auto st = std::filesystem::status(std::filesystem::path(path), ec);
+        if (ec || !std::filesystem::is_regular_file(st)) {
+            throw std::runtime_error(format("MoE expert streaming requires a regular file, cannot stream '%s'", path.c_str()));
         }
     }
 
@@ -597,7 +641,10 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     sl->uniq.clear();
     for (int64_t i = 0; i < n; i++) {
         const int32_t e = ids[i];
-        GGML_ASSERT(e >= 0 && (uint32_t) e < sl->n_expert);
+        if (e < 0 || (uint32_t) e >= sl->n_expert) {
+            GGML_ABORT("MoE expert streaming: layer %d got expert id %d (valid range 0..%u)",
+                    sl->il, e, sl->n_expert - 1);
+        }
         if (!sl->touched[e]) {
             sl->touched[e] = 1;
             sl->uniq.push_back(e);
