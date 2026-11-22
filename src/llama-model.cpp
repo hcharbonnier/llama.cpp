@@ -5,6 +5,7 @@
 #include "llama-hparams.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
+#include "llama-moe-stream.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 
@@ -1401,6 +1402,9 @@ struct llama_model::impl {
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
 
+    // SSD-streamed MoE expert weights, null when streaming is off
+    std::unique_ptr<llama_moe_stream> moe_stream;
+
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
@@ -1754,6 +1758,129 @@ void llama_model_base::load_prec_policy(llama_model_loader & ml) {
     prec_policy.load(ml, *this);
 }
 
+static bool llama_moe_stream_is_exps(llm_tensor tensor) {
+    switch (tensor) {
+        case LLM_TENSOR_FFN_GATE_EXPS:
+        case LLM_TENSOR_FFN_UP_EXPS:
+        case LLM_TENSOR_FFN_DOWN_EXPS:
+        case LLM_TENSOR_FFN_GATE_UP_EXPS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// like select_weight_buft, but only consider each device's default buffer type: extra buffer
+// types (e.g. CPU weight repacking) may not support the partial writes that slot-wise expert
+// cache updates require
+static ggml_backend_buffer_type_t llama_moe_stream_select_buft(const llama_hparams & hparams, const ggml_tensor * meta, const buft_list_t * buft_list) {
+    for (const auto & [dev, buft] : *buft_list) {
+        if (buft != ggml_backend_dev_buffer_type(dev)) {
+            continue;
+        }
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead()*8,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(params) };
+        if (!ctx) {
+            throw std::runtime_error(format("%s: failed to create ggml context", __func__));
+        }
+
+        ggml_tensor t_meta = *meta;
+        ggml_tensor * w = ggml_dup_tensor(ctx.get(), &t_meta);
+        const uint32_t n_ids = std::max<uint32_t>(hparams.n_expert_used_max(), 1);
+        ggml_tensor * b   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, w->ne[0], n_ids, 512);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_ids, 512);
+        ggml_tensor * op_tensor = ggml_mul_mat_id(ctx.get(), w, b, ids);
+
+        w->buffer = ggml_backend_buft_alloc_buffer(buft, 0);
+        const bool op_supported = w->buffer != nullptr && ggml_backend_dev_supports_op(dev, op_tensor);
+        if (w->buffer != nullptr) {
+            ggml_backend_buffer_free(w->buffer);
+            w->buffer = nullptr;
+        }
+
+        if (op_supported) {
+            return buft;
+        }
+    }
+    return buft_list->empty() ? nullptr : buft_list->front().second;
+}
+
+static bool llama_moe_stream_is_exps_name(const std::string & name) {
+    for (const char * suffix : { ".ffn_gate_exps.weight", ".ffn_up_exps.weight", ".ffn_down_exps.weight", ".ffn_gate_up_exps.weight" }) {
+        const size_t len = strlen(suffix);
+        if (name.size() >= len && name.compare(name.size() - len, len, suffix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// resolve the per-layer expert cache slot count; returns 0 when streaming should not be enabled
+// (not a MoE model, or the cache would hold every expert anyway)
+static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params, const llama_hparams & hparams, const llama_model_loader & ml) {
+    if (hparams.n_expert == 0 || hparams.n_expert_used_max() == 0) {
+        LLAMA_LOG_WARN("%s: MoE expert streaming requires a MoE model -- disabled\n", __func__);
+        return 0;
+    }
+
+    uint32_t n_slots = params.moe_stream_slots;
+
+    bool cache_from_budget = false;
+    if (n_slots == 0 && params.moe_stream_budget > 0) {
+        // derive the per-layer slot count from the total byte budget
+        size_t nb_expert_sum = 0; // bytes of one expert across every streamable layer
+        for (const auto & [name, w] : ml.weights_map) {
+            if (llama_moe_stream_is_exps_name(name) && w.tensor->ne[2] == hparams.n_expert) {
+                nb_expert_sum += ggml_nbytes(w.tensor)/w.tensor->ne[2];
+            }
+        }
+        if (nb_expert_sum > 0) {
+            n_slots = std::max<uint64_t>(params.moe_stream_budget/nb_expert_sum, hparams.n_expert_used_max());
+            cache_from_budget = true;
+        }
+    }
+
+    const bool cache_from_params = params.moe_stream_slots > 0 || cache_from_budget;
+
+    if (n_slots == 0) {
+        n_slots = std::max<uint32_t>(2*hparams.n_expert_used_max(), 16);
+    }
+
+    // one remap call is one ubatch; it must hold every distinct expert of a decode step
+    const uint32_t n_slots_min = hparams.n_expert_used_max();
+
+    if (n_slots_min >= hparams.n_expert) {
+        LLAMA_LOG_WARN("%s: MoE expert streaming needs at least %u slots (n_expert_used), but the model has only %u experts -- streaming disabled, loading normally\n",
+                __func__, n_slots_min, hparams.n_expert);
+        return 0;
+    }
+
+    if (n_slots < n_slots_min) {
+        if (cache_from_params) {
+            // an explicit --moe-stream-cache is a hard budget: fail at load instead of hitting
+            // the graph-build abort on the first batch that needs more slots
+            throw std::runtime_error(format("%s: --moe-stream-cache gives %u slots per layer, but at least %u (n_expert_used) are needed; increase --moe-stream-cache",
+                    __func__, n_slots, n_slots_min));
+        }
+        LLAMA_LOG_WARN("%s: raising MoE expert cache from %u to %u slots (n_expert_used)\n",
+                __func__, n_slots, n_slots_min);
+        n_slots = n_slots_min;
+    }
+
+    if (n_slots >= hparams.n_expert) {
+        LLAMA_LOG_WARN("%s: MoE expert cache of %u slots covers all %u experts -- streaming disabled, loading normally\n",
+                __func__, n_slots, hparams.n_expert);
+        return 0;
+    }
+
+    return n_slots;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1869,6 +1996,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+
+    if (params.moe_stream) {
+        if (!hdmd.rot.empty() || !hdmd.inv.empty()) {
+            throw std::runtime_error(format("%s: MoE expert streaming does not support prism.hadamard folded weights yet", __func__));
+        }
+        const uint32_t n_slots = llama_moe_stream_resolve_slots(params, hparams, ml);
+        if (n_slots > 0) {
+            if (pimpl->has_tensor_overrides) {
+                LLAMA_LOG_WARN("%s: tensor buffer overrides (-ot/--cpu-moe) do not apply to streamed expert tensors\n", __func__);
+            }
+            pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream_io_threads, params.moe_stream_direct);
+            LLAMA_LOG_INFO("%s: MoE expert streaming enabled, %u of %u experts cached per layer, %d I/O threads\n",
+                    __func__, n_slots, hparams.n_expert, pimpl->moe_stream->n_io_threads);
+        }
+    }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -2111,8 +2253,37 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_prec_policy(ml);
+    // the streamed expert cache tensors are not in ml.ctx_map; expose them under their original
+    // names and map their per-expert scales by hand (their ne[2] is the cache size, not n_expert)
+    if (pimpl->moe_stream) {
+        std::unordered_map<std::string, ggml_tensor *> tensors_by_name_map;
+        for (const auto & [name, t] : tensors_by_name) {
+            tensors_by_name_map.emplace(name, t);
+        }
+        for (const auto & sl : pimpl->moe_stream->layers) {
+            if (!sl) {
+                continue;
+            }
+            for (const auto & wt : sl->weights) {
+                const std::string name = ggml_get_name(wt.cache);
+                const auto it = tensors_by_name_map.find(name + ".scale");
+                if (it != tensors_by_name_map.end() &&
+                        it->second->ne[0] == (int64_t) sl->n_expert &&
+                        ggml_nelements(it->second) == (int64_t) sl->n_expert) {
+                    w_scales.emplace(wt.cache, it->second);
+                }
+                tensors_by_name.emplace_back(name, wt.cache);
+            }
+        }
+    }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+
+    // streamed expert ranges are read on demand, so do not prefetch them into the page cache;
+    // mlock would pin those ranges too, so it is disabled with streaming
+    if (pimpl->moe_stream && use_mlock) {
+        LLAMA_LOG_WARN("%s: --mlock is ignored with MoE expert streaming (it would pin the expert cache source ranges)\n", __func__);
+    }
+    ml.init_mappings(pimpl->moe_stream == nullptr, pimpl->moe_stream == nullptr && use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2220,6 +2391,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
     }
 
+    if (pimpl->moe_stream) {
+        if (pimpl->moe_stream->ctxs.empty()) {
+            LLAMA_LOG_WARN("%s: no streamable expert tensors found -- MoE expert streaming disabled\n", __func__);
+            pimpl->moe_stream.reset();
+        } else {
+            pimpl->moe_stream->alloc_bufs(ml.no_alloc);
+            if (!ml.no_alloc) {
+                std::vector<std::string> paths;
+                paths.reserve(ml.files.size());
+                for (const auto & file : ml.files) {
+                    paths.emplace_back(file->path());
+                }
+                pimpl->moe_stream->open_files(paths);
+                pimpl->moe_stream->clamp_io_staging();
+            }
+        }
+    }
+
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
 
@@ -2258,7 +2447,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, bufs] : ctx_bufs) {
-        if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+        if (!ml.load_all_data(ctx, bufs, use_mlock && pimpl->moe_stream == nullptr ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
@@ -2615,6 +2804,37 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
     }
+
+    // route MoE routed-expert weights to the streaming expert cache instead of materializing them
+    if (pimpl->moe_stream && tn.bid >= 0 && buft_list_layer != nullptr &&
+        (flags & (TENSOR_DUPLICATED | TENSOR_SKIP | TENSOR_SKIP_IF_VIRTUAL | TENSOR_READ_LAZY)) == 0 &&
+        llama_moe_stream_is_exps(tn.tensor) && tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0) {
+        const std::string name = tn.str();
+        const auto * w = ml.get_weight(name.c_str());
+
+        bool dims_ok = w != nullptr && w->tensor->ne[2] == (int64_t) hparams.n_expert;
+        if (dims_ok) {
+            size_t dim = 0;
+            for (int64_t d : ne) {
+                dims_ok = dims_ok && d == w->tensor->ne[dim++];
+            }
+        }
+
+        if (dims_ok) {
+            // register the skip so that the loader tensor accounting stays consistent; returns nullptr
+            ml.create_tensor(
+                hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+                tn, ne, flags | llama_model_loader::TENSOR_STREAMED);
+
+            ggml_backend_buffer_type_t buft = llama_moe_stream_select_buft(hparams, w->tensor, buft_list_layer);
+            if (buft == nullptr) {
+                throw std::runtime_error(format("failed to find a buffer type for streamed tensor %s", name.c_str()));
+            }
+
+            return pimpl->moe_stream->create_cache_tensor(tn.bid, buft, w->tensor, w->idx, w->offs);
+        }
+    }
+
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
@@ -2686,7 +2906,17 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
             }
         }
     }
+    // the streamed expert cache lives in its own contexts, count it as model memory
+    if (pimpl->moe_stream) {
+        for (const auto & [buft, size] : pimpl->moe_stream->memory_breakdown()) {
+            ret[buft] += size;
+        }
+    }
     return ret;
+}
+
+llama_moe_stream * llama_model::moe_stream() const {
+    return pimpl->moe_stream.get();
 }
 
 uint64_t llama_model::n_elements() const {
@@ -3697,6 +3927,9 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.moe_stream_slots            =*/ 0,
+        /*.moe_stream_budget           =*/ 0,
+        /*.moe_stream_io_threads       =*/ 0,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
@@ -3706,6 +3939,8 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.moe_stream                  =*/ false,
+        /*.moe_stream_direct           =*/ false,
     };
 
     return result;
