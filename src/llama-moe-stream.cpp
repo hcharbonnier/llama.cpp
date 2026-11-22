@@ -115,30 +115,49 @@ static size_t moe_stream_staging_size(size_t max_nb_expert) {
 // within staging, or nullptr on failure
 static const uint8_t * llama_moe_stream_pread(llama_file & file, uint8_t * staging, size_t len, size_t offs, bool direct) {
 #ifdef _WIN32
-    GGML_UNUSED(direct);
     // ReadFile with an explicit offset is a positional read, so the I/O workers do not share a
-    // file pointer and can load experts in parallel
-    const intptr_t os_handle = _get_osfhandle(file.file_id());
-    if (os_handle == -1) {
-        return nullptr;
+    // file pointer and can load experts in parallel. direct reads use the unbuffered handle and
+    // the aligned window [aoffs, aoffs + total), then return the slice holding the requested bytes.
+    const size_t a     = MOE_STREAM_DIRECT_ALIGN;
+    size_t       aoffs = offs;
+    size_t       head  = 0;
+    size_t       total = len;
+
+    HANDLE h = direct ? (HANDLE) file.direct_handle() : INVALID_HANDLE_VALUE;
+    if (h != nullptr && h != INVALID_HANDLE_VALUE) {
+        aoffs = offs & ~(a - 1);
+        head  = offs - aoffs;
+        total = ((head + len + a - 1)/a)*a;
+    } else {
+        const intptr_t os_handle = _get_osfhandle(file.file_id());
+        if (os_handle == -1) {
+            return nullptr;
+        }
+        h = (HANDLE) os_handle;
     }
+
+    // a direct read of the aligned window may run past EOF: only head + len bytes must be present
+    const size_t need = head + len;
     uint8_t * p    = staging;
-    size_t    left = len;
-    ULONGLONG off  = (ULONGLONG) offs;
-    while (left > 0) {
+    size_t    got  = 0;
+    ULONGLONG off  = (ULONGLONG) aoffs;
+    while (got < total) {
         OVERLAPPED ov = {};
         ov.Offset     = (DWORD) (off & 0xffffffffull);
         ov.OffsetHigh = (DWORD) (off >> 32);
-        const DWORD chunk = (DWORD) std::min<size_t>(left, (size_t) 1 << 30);
+        const DWORD chunk = (DWORD) std::min<size_t>(total - got, (size_t) 1 << 30);
         DWORD nread = 0;
-        if (!ReadFile((HANDLE) os_handle, p, chunk, &nread, &ov) || nread == 0) {
-            return nullptr;
+        if (!ReadFile(h, p, chunk, &nread, &ov) || nread == 0) {
+            break;
         }
-        p    += nread;
-        off  += nread;
-        left -= nread;
+        p   += nread;
+        off += nread;
+        got += nread;
     }
-    return staging;
+    if (got < need) {
+        return nullptr;
+    }
+    return staging + head;
 #else
     const int fd = file.file_id();
 
@@ -1000,14 +1019,6 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
         }
     };
 
-#ifdef _WIN32
-    if (use_direct_io) {
-        // llama_file::has_direct_io() is true on Windows but there is no O_DIRECT equivalent
-        LLAMA_LOG_WARN("%s: O_DIRECT is not supported on Windows, falling back to buffered streaming reads\n", __func__);
-        use_direct_io = false;
-    }
-#endif
-
     open_all(use_direct_io);
 
     for (const auto & sl : layers) {
@@ -1020,14 +1031,18 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
         }
     }
 
-    // fall back to buffered when O_DIRECT is unusable: either the open did not honor it (macOS,
-    // Windows, unsupported filesystems), or it opened but a probe read fails (some network/overlay
-    // filesystems accept the flag then reject aligned reads). reopening is needed because O_DIRECT
-    // is a property of the fd. done here, single-threaded, before any worker starts.
+    // fall back to buffered when direct I/O is unusable: either the open did not honor it
+    // (unsupported filesystems), an alignment exceeds the staging alignment, or a probe read
+    // fails (some network/overlay filesystems accept the flag then reject aligned reads).
+    // reopening is needed because the flag is a property of the handle. done here,
+    // single-threaded, before any worker starts.
     if (use_direct_io) {
         bool ok = !files.empty();
         for (const auto & file : files) {
             ok = ok && file->has_direct_io();
+#ifdef _WIN32
+            ok = ok && file->read_alignment() <= MOE_STREAM_DIRECT_ALIGN;
+#endif
         }
         if (ok) {
             uint8_t * probe = (uint8_t *) moe_aligned_alloc(MOE_STREAM_DIRECT_ALIGN);
@@ -1041,14 +1056,18 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
             moe_aligned_free(probe);
         }
         if (!ok) {
-            LLAMA_LOG_WARN("%s: O_DIRECT not usable, falling back to buffered streaming reads\n", __func__);
+            LLAMA_LOG_WARN("%s: direct I/O not usable, falling back to buffered streaming reads\n", __func__);
             use_direct_io = false;
             open_all(false);
         }
     }
 
     if (use_direct_io) {
+#ifdef _WIN32
+        LLAMA_LOG_INFO("%s: MoE expert streaming uses unbuffered reads (FILE_FLAG_NO_BUFFERING, page cache bypassed)\n", __func__);
+#else
         LLAMA_LOG_INFO("%s: MoE expert streaming uses O_DIRECT (page cache bypassed)\n", __func__);
+#endif
     }
 
     // one token drives ~one remap per streamed layer, so decaying every 64 tokens is
@@ -1120,7 +1139,7 @@ void llama_moe_stream::worker_loop() {
     llama_files worker_files;
     try {
         for (const auto & path : file_paths) {
-            worker_files.emplace_back(new llama_file(path.c_str(), "rb", false));
+            worker_files.emplace_back(new llama_file(path.c_str(), "rb", use_direct_io));
         }
     } catch (...) {
         std::lock_guard<std::mutex> lock(mtx);
