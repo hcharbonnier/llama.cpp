@@ -6,9 +6,14 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <stdexcept>
+#include <thread>
+#include <atomic>
 
 #ifdef _WIN32
 #include <io.h>
@@ -26,6 +31,9 @@ static const uint32_t MOE_STREAM_IO_THREADS_DEFAULT = 16;
 static const uint32_t MOE_STREAM_IO_THREADS_MAX     = 32;
 static const int64_t  MOE_STREAM_HOT_DECAY_TOKENS   = 64;
 static const size_t   MOE_STREAM_STAGING_MAX        = 1ull*1024*1024*1024; // cap on the total staging of the I/O workers
+static const uint64_t MOE_STREAM_RAM_FREE_PERCENT   = 50; // host mirror budget cap, in percent of available physical RAM
+static const size_t   MOE_STREAM_FILL_CHUNK         = 64ull*1024*1024; // bulk read size of the load-time mirror fill
+static const int32_t  MOE_STREAM_FILL_THREADS_MAX   = 8;
 
 // O_DIRECT alignment: 4096 is a multiple of any device logical block size (512/4096), so it is
 // universally valid, and reading a few extra KB of head/tail padding per slab is negligible
@@ -57,6 +65,40 @@ static void moe_aligned_free(void * p) {
     _aligned_free(p);
 #else
     free(p);
+#endif
+}
+
+// available physical RAM, 0 when unknown
+static uint64_t llama_moe_stream_phys_avail() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status)) {
+        return 0;
+    }
+    return status.ullAvailPhys;
+#else
+    // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES (MemFree)
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f != nullptr) {
+        char line[256];
+        uint64_t avail_kb = 0;
+        while (fgets(line, sizeof(line), f) != nullptr) {
+            if (sscanf(line, "MemAvailable: %" SCNu64 " kB", &avail_kb) == 1) {
+                break;
+            }
+        }
+        fclose(f);
+        if (avail_kb > 0) {
+            return avail_kb * 1024;
+        }
+    }
+    const long pages     = sysconf(_SC_AVPHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page_size <= 0) {
+        return 0;
+    }
+    return (uint64_t) pages * (uint64_t) page_size;
 #endif
 }
 
@@ -201,8 +243,9 @@ llama_moe_stream_layer * llama_moe_stream::find_layer(
 }
 
 // sizes the per-layer table and clamps the I/O thread count; workers are spawned lazily on first use
-llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct)
-        : n_slots(n_slots) {
+llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct,
+        uint64_t ram_budget, bool ram_auto)
+        : n_slots(n_slots), ram_budget(ram_budget), ram_auto(ram_auto) {
     layers.resize(n_layer);
 
     this->n_io_threads = n_io_threads <= 0 ? MOE_STREAM_IO_THREADS_DEFAULT : n_io_threads;
@@ -212,6 +255,7 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
     this->n_io_threads = std::min<int32_t>(this->n_io_threads, MOE_STREAM_IO_THREADS_MAX);
 
     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
+    trace         = std::getenv("LLAMA_MOE_STREAM_TRACE") != nullptr;
     use_direct_io = direct;
 }
 
@@ -334,6 +378,228 @@ void llama_moe_stream::clamp_io_staging() {
             __func__, n_io_threads, staging_size / 1024.0 / 1024.0,
             staging_size * (size_t) n_io_threads / 1024.0 / 1024.0,
             MOE_STREAM_STAGING_MAX / 1024.0 / 1024.0);
+}
+
+// mirror an even share of the experts of every streamed layer in host memory, so their device
+// misses are a PCIe copy instead of a file read. The budget is split by layer, not consumed as a
+// prefix. Pinned host memory is used when the device exposes it, pageable host memory otherwise.
+void llama_moe_stream::fill_host_mirror() {
+    if (ram_budget == 0 && !ram_auto) {
+        return;
+    }
+
+    const uint64_t ram_free = llama_moe_stream_phys_avail();
+    const uint64_t ram_cap  = ram_free > 0 ? ram_free * MOE_STREAM_RAM_FREE_PERCENT / 100 : 0;
+
+    if (ram_auto) {
+        if (ram_cap == 0) {
+            LLAMA_LOG_WARN("%s: cannot read available physical RAM, host mirror disabled\n", __func__);
+            return;
+        }
+        ram_budget = (size_t) ram_cap;
+        LLAMA_LOG_INFO("%s: host mirror budget = %.2f GiB (%" PRIu64 "%% of available physical RAM)\n",
+                __func__, ram_budget / 1024.0 / 1024.0 / 1024.0, MOE_STREAM_RAM_FREE_PERCENT);
+    } else if (ram_cap > 0 && ram_budget > ram_cap) {
+        LLAMA_LOG_INFO("%s: host mirror budget %.2f GiB exceeds %" PRIu64 "%% of available physical RAM (%.2f GiB), using it as requested\n",
+                __func__, ram_budget / 1024.0 / 1024.0 / 1024.0, MOE_STREAM_RAM_FREE_PERCENT,
+                ram_cap / 1024.0 / 1024.0 / 1024.0);
+    }
+    if (ram_budget == 0) {
+        return;
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    struct job {
+        llama_moe_stream_weight * wt;
+        uint32_t first;
+        uint32_t last;
+        uint8_t * dst;
+    };
+    std::vector<job> jobs;
+
+    auto expert_bytes = [](const llama_moe_stream_layer & sl) {
+        size_t nb = 0;
+        for (const auto & wt : sl.weights) {
+            nb += wt.nb_expert;
+        }
+        return nb;
+    };
+
+    uint32_t n_mirror_layers = 0;
+    uint32_t n_device        = 0;
+    uint32_t n_host          = 0;
+
+    for (const auto & sl_ptr : layers) {
+        if (sl_ptr == nullptr) {
+            continue;
+        }
+        const auto & sl = *sl_ptr;
+
+        if (ggml_backend_buffer_is_host(sl.weights[0].cache->buffer)) {
+            n_host++;
+            continue; // the cache already lives in RAM, a mirror would duplicate it
+        }
+        n_device++;
+        if (expert_bytes(sl) > 0) {
+            n_mirror_layers++;
+        }
+    }
+
+    if (n_mirror_layers == 0) {
+        if (n_host > 0 && n_device == 0) {
+            LLAMA_LOG_WARN("%s: expert cache is in host memory, host mirror is redundant -- disabled\n", __func__);
+        }
+        return;
+    }
+
+    const size_t budget_per_layer = ram_budget / n_mirror_layers;
+
+    uint32_t n_layers   = 0;
+    size_t   n_mirrored = 0;
+    bool     pinned     = true;
+
+    for (auto & sl_ptr : layers) {
+        if (sl_ptr == nullptr) {
+            continue;
+        }
+        auto & sl = *sl_ptr;
+
+        if (ggml_backend_buffer_is_host(sl.weights[0].cache->buffer)) {
+            continue;
+        }
+
+        const size_t   nb_expert = expert_bytes(sl);
+        const uint32_t n_expert  = sl.n_expert;
+        if (nb_expert == 0) {
+            continue;
+        }
+
+        const uint32_t n_host_expert = (uint32_t) std::min<size_t>(n_expert, budget_per_layer / nb_expert);
+        if (n_host_expert == 0) {
+            continue;
+        }
+
+        const size_t nb_layer = (size_t) n_host_expert*nb_expert;
+
+        // prefer a pinned host buffer so the mirror feeds device copies directly; fall back to
+        // pageable host memory when the device does not expose one
+        const ggml_backend_buffer_type_t cache_buft = ggml_backend_buffer_get_type(sl.weights[0].cache->buffer);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(cache_buft);
+        ggml_backend_dev_props props = {};
+        if (dev != nullptr) {
+            ggml_backend_dev_get_props(dev, &props);
+        }
+        ggml_backend_buffer_type_t buft = dev != nullptr && props.caps.host_buffer ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (buft == nullptr || !ggml_backend_buft_is_host(buft)) {
+            buft   = ggml_backend_cpu_buffer_type();
+            pinned = false;
+        }
+
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, nb_layer);
+        if (buf == nullptr) {
+            LLAMA_LOG_WARN("%s: host mirror allocation failed at layer %d, layer reads from file\n", __func__, sl.il);
+            continue;
+        }
+
+        uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf);
+        if (base == nullptr || !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buf))) {
+            ggml_backend_buffer_free(buf);
+            LLAMA_LOG_WARN("%s: host mirror buffer has no host base at layer %d, layer reads from file\n", __func__, sl.il);
+            continue;
+        }
+        host_bufs.emplace_back(buf);
+
+        for (auto & wt : sl.weights) {
+            jobs.push_back({ &wt, 0, n_host_expert, base });
+            base += (size_t) n_host_expert*wt.nb_expert;
+        }
+
+        n_mirrored += nb_layer;
+        n_layers++;
+    }
+
+    if (jobs.empty()) {
+        LLAMA_LOG_WARN("%s: no layer could be mirrored, host mirror disabled\n", __func__);
+        host_bufs.clear();
+        return;
+    }
+
+    const int32_t n_threads = std::max<int32_t>(1, std::min<int32_t>(
+            std::min<int32_t>(n_io_threads, MOE_STREAM_FILL_THREADS_MAX), (int32_t) jobs.size()));
+    const size_t fill_staging = std::max(MOE_STREAM_FILL_CHUNK, max_nb_expert) + 4*MOE_STREAM_DIRECT_ALIGN;
+
+    std::atomic<size_t> next{0};
+    std::atomic<bool>   failed{false};
+
+    auto fill_worker = [&]() {
+        llama_files thread_files;
+        try {
+            for (const auto & path : file_paths) {
+                thread_files.emplace_back(new llama_file(path.c_str(), "rb", use_direct_io));
+            }
+        } catch (...) {
+            failed = true;
+            return;
+        }
+
+        uint8_t * staging = (uint8_t *) moe_aligned_alloc(fill_staging);
+        if (staging == nullptr) {
+            failed = true;
+            return;
+        }
+
+        while (!failed) {
+            const size_t i = next++;
+            if (i >= jobs.size()) {
+                break;
+            }
+            const job & j = jobs[i];
+            const size_t   nb = j.wt->nb_expert;
+            const uint32_t g  = (uint32_t) std::max<size_t>(MOE_STREAM_FILL_CHUNK/nb, 1);
+            llama_file & wf = *thread_files[j.wt->file_idx];
+
+            for (uint32_t e = j.first; e < j.last && !failed; e += g) {
+                const uint32_t n  = std::min(g, j.last - e);
+                const size_t   sz = (size_t) n*nb;
+
+                const uint8_t * src = llama_moe_stream_pread(wf, staging, sz, j.wt->offs + (size_t) e*nb, use_direct_io);
+                if (src == nullptr) {
+                    failed = true;
+                    break;
+                }
+                memcpy(j.dst + (size_t) (e - j.first)*nb, src, sz);
+            }
+        }
+        moe_aligned_free(staging);
+    };
+
+    std::vector<std::thread> fill_threads;
+    fill_threads.reserve(n_threads - 1);
+    for (int32_t i = 0; i + 1 < n_threads; i++) {
+        fill_threads.emplace_back(fill_worker);
+    }
+    fill_worker();
+    for (auto & t : fill_threads) {
+        t.join();
+    }
+
+    if (failed) {
+        // nothing was published yet, so the workers still fall back to the file on every miss
+        host_bufs.clear();
+        throw std::runtime_error("MoE expert streaming: failed to fill the expert host mirror");
+    }
+
+    // publish only once every slab is in place, so a partial fill is never visible to the workers
+    for (const auto & j : jobs) {
+        j.wt->host       = j.dst;
+        j.wt->host_first = j.first;
+        j.wt->host_last  = j.last;
+    }
+
+    LLAMA_LOG_INFO("%s: expert host mirror = %.2f GiB over %u layers (%s, %.2f s)\n",
+            __func__, n_mirrored / 1024.0 / 1024.0 / 1024.0, n_layers, pinned ? "pinned" : "pageable",
+            (ggml_time_us() - t_start)/1e6);
 }
 
 void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
@@ -513,13 +779,21 @@ void llama_moe_stream::worker_loop() {
         lk.unlock();
 
         bool ok = true;
+        bool from_ram = true;
         for (const auto & wt : sl.weights) {
+            const uint8_t * data = nullptr;
+            if (wt.host != nullptr && (uint32_t) w.expert >= wt.host_first && (uint32_t) w.expert < wt.host_last) {
+                // static host mirror: the miss is a PCIe copy, not a file read
+                data = wt.host + (size_t) (w.expert - wt.host_first)*wt.nb_expert;
+            } else {
+                from_ram = false;
 #ifdef _WIN32
-            llama_file & wf = *worker_files[wt.file_idx];
+                llama_file & wf = *worker_files[wt.file_idx];
 #else
-            llama_file & wf = *files[wt.file_idx];
+                llama_file & wf = *files[wt.file_idx];
 #endif
-            const uint8_t * data = llama_moe_stream_pread(wf, staging, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
+                data = llama_moe_stream_pread(wf, staging, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
+            }
             if (data == nullptr) {
                 ok = false;
                 break;
@@ -534,6 +808,11 @@ void llama_moe_stream::worker_loop() {
             load_failed = true;
         } else {
             sl.slot_state[w.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
+            if (from_ram) {
+                stats.n_load_ram++;
+            } else {
+                stats.n_load_disk++;
+            }
             if (debug) {
                 LLAMA_LOG_DEBUG("%s: layer %d: expert %d -> slot %d\n", __func__, sl.il, w.expert, w.slot);
             }
@@ -581,6 +860,7 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t 
             LLAMA_LOG_DEBUG("%s: layer %d: evict expert %d from slot %d\n", __func__, sl.il, sl.slot_expert[slot], slot);
         }
         sl.expert_slot[sl.slot_expert[slot]] = -1;
+        stats.n_evictions++;
     }
 
     sl.slot_expert[slot] = expert;
@@ -602,6 +882,21 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_stream::memory_breakdown(
         }
     }
     return res;
+}
+
+void llama_moe_stream::print_stats() const {
+    std::lock_guard<std::mutex> lock(mtx);
+
+    const int64_t n_touched = stats.n_hit + stats.n_miss;
+    const int64_t n_loads   = stats.n_load_ram + stats.n_load_disk;
+    LLAMA_LOG_INFO("%s: moe stream: remap calls = %" PRId64 ", expert hits = %" PRId64 ", misses = %" PRId64 ", hit rate = %.2f%%\n",
+            __func__, n_calls, stats.n_hit, stats.n_miss,
+            n_touched > 0 ? 100.0*stats.n_hit/n_touched : 0.0);
+    LLAMA_LOG_INFO("%s: moe stream: expert loads = %" PRId64 " (ram = %" PRId64 ", disk = %" PRId64 "), ram hit rate = %.2f%%, evictions = %" PRId64 "\n",
+            __func__, n_loads, stats.n_load_ram, stats.n_load_disk,
+            n_loads > 0 ? 100.0*stats.n_load_ram/n_loads : 0.0, stats.n_evictions);
+    LLAMA_LOG_INFO("%s: moe stream: load stall = %.2f ms total (%.3f ms per remap call)\n",
+            __func__, stats.t_stall_us/1000.0, n_calls > 0 ? stats.t_stall_us/1000.0/n_calls : 0.0);
 }
 
 // custom-op callback (single-threaded on ith 0): given the router's expert ids, ensure every touched
@@ -657,6 +952,12 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
                 sl->il, sl->uniq.size(), sl->n_slots);
     }
 
+    // routing trace (off by default); n = number of router ids, so a single-token decode call has n == n_expert_used
+    if (mgr->trace) {
+        LLAMA_LOG_INFO("%s: moe trace: layer=%d call=%" PRId64 " ids=%" PRId64 " distinct=%zu\n",
+                __func__, sl->il, mgr->n_calls, n, sl->uniq.size());
+    }
+
     // route hotness for eviction; halved periodically so a formerly-hot expert ages out
     mgr->update_hotness_locked(*sl);
 
@@ -673,6 +974,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
                 mgr->cv_work.notify_one();
                 waited = true;
             }
+            mgr->stats.n_hit++;
             sl->keep[s] = 1;
             sl->demand_slots.push_back(s);
         } else {
@@ -687,6 +989,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
             mgr->reserve_slot_locked(*sl, e, v);
             mgr->q_demand.push_back({ sl, e, v, sl->slot_gen[v] });
             mgr->cv_work.notify_one();
+            mgr->stats.n_miss++;
             waited = true;
             sl->keep[v] = 1;
             sl->demand_slots.push_back(v);
@@ -694,6 +997,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     }
 
     if (waited) {
+        const int64_t t0 = ggml_time_us();
         mgr->cv_done.wait(lk, [&]{
             if (mgr->load_failed) {
                 return true;
@@ -708,6 +1012,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         if (mgr->load_failed) {
             GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
         }
+        mgr->stats.t_stall_us += ggml_time_us() - t0;
     }
 
     for (int64_t i = 0; i < n; i++) {
