@@ -1894,7 +1894,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * slots,
-                 bool   cached) const {
+                 bool   cached,
+                 bool   may_skip) const {
     ggml_tensor * w_s = model.get_w_scale(w);
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
@@ -1909,6 +1910,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
 
     // after the NVFP4 default, so that the policy can request a higher precision
     prec_policy.apply(res, w);
+
+    if (may_skip) {
+        // tells the backend that ids may contain -1, so it must zero the skipped dst rows
+        ggml_mul_mat_set_hint(res, GGML_HINT_MUL_MAT_ID_HAS_SKIPPED);
+    }
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -2569,12 +2575,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
     // ids are the selected experts, for the biases and scales
-    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
+    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached, bool has_skipped) {
         ggml_tensor * up = nullptr;
 
         if (gate_up_exps) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, mm_ids, cached); // [n_ff*2, n_expert_used, n_tokens]
+            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, mm_ids, cached, has_skipped); // [n_ff*2, n_expert_used, n_tokens]
             cb(gate_up, "ffn_moe_gate_up", il);
 
             if (gate_up_exps_b) {
@@ -2589,7 +2595,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(up, "ffn_moe_up", il);
         } else {
             // separate gate and up path
-            up = build_lora_mm_id(up_exps, cur, ids, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
+            up = build_lora_mm_id(up_exps, cur, ids, mm_ids, cached, has_skipped); // [n_ff, n_expert_used, n_tokens]
             cb(up, "ffn_moe_up", il);
 
             if (up_exps_b) {
@@ -2598,7 +2604,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (gate_exps) {
-                cur = build_lora_mm_id(gate_exps, cur, ids, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
+                cur = build_lora_mm_id(gate_exps, cur, ids, mm_ids, cached, has_skipped); // [n_ff, n_expert_used, n_tokens]
                 cb(cur, "ffn_moe_gate", il);
             } else {
                 cur = up;
@@ -2708,7 +2714,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
-        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
+        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids, cached, has_skipped); // [n_embd, n_expert_used, n_tokens]
         cb(experts, "ffn_moe_down", il);
 
         if (amax_src1.scale_s) {
@@ -2749,7 +2755,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     args, n_args, llama_moe_stream_wave_ids, 1, msl->wave_userdata(w, stream_wave_cap));
             cb(ids_w, "ffn_moe_wave_ids", il);
 
-            ggml_tensor * e_w = build_experts(cur, selected_experts, ids_w, false);
+            ggml_tensor * e_w = build_experts(cur, selected_experts, ids_w, false, true);
 
             // ids_w holds slot ids and -1 for the other waves; step(id + 0.5) keeps this wave, drops -1
             ggml_tensor * mask_w = ggml_cast(ctx0, ids_w, GGML_TYPE_F32);
@@ -2765,10 +2771,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     } else {
         experts = cache.slots == nullptr ?
-            build_experts(cur, selected_experts, mm_ids, mm_ids == nullptr) :
+            build_experts(cur, selected_experts, mm_ids, mm_ids == nullptr, false) :
             moe_cache->build_experts(*this, cache, cur, selected_experts,
                     [](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached, void * user_data) {
-                        return (*static_cast<decltype(build_experts) *>(user_data))(cur, ids, mm_ids, cached);
+                        return (*static_cast<decltype(build_experts) *>(user_data))(cur, ids, mm_ids, cached, false);
                     }, &build_experts);
     }
 
