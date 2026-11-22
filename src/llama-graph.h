@@ -25,6 +25,7 @@ struct llama_hadamard;
 
 class llama_moe_cache;
 struct llama_moe_stream;
+struct llama_moe_stream_layer;
 
 struct llama_memory_context_i;
 
@@ -1136,6 +1137,10 @@ struct llm_graph_context {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
     llama_moe_stream             * mstream;
+
+    // streamed layers already remapped in this graph; evaluating one layer twice would let the
+    // second remap evict slots the first one still needs
+    mutable std::vector<const llama_moe_stream_layer *> mstream_layers;
 
     const llama_hadamard * hdmd;
 
