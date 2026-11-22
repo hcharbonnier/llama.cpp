@@ -2262,12 +2262,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         moe_stream_prefill_guard(llama_moe_stream * ms, bool active) : ms(ms), prev(false) {
             if (ms != nullptr) {
-                prev = ms->prefill_active.exchange(active);
+                prev = ms->set_prefill(active);
             }
         }
         ~moe_stream_prefill_guard() {
             if (ms != nullptr) {
-                ms->prefill_active.store(prev);
+                ms->set_prefill(prev);
             }
         }
     } prefill_guard(model.moe_stream(), n_tokens_all > 1);
