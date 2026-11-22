@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_moe_stream;
 struct llama_model;
 
 // available models
@@ -1032,6 +1033,9 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
     bool no_alloc() const;
+
+    // null when MoE expert streaming is off
+    llama_moe_stream * moe_stream() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

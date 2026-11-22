@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-stream.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -1717,6 +1718,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    mstream          (params.mstream),
     hdmd             (model.hdmd.rot.empty() ? nullptr : &model.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
     layer_inp_src    (params.layer_inp_src),
@@ -2515,6 +2517,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const llama_moe_cache_lookup cache = moe_cache == nullptr ? llama_moe_cache_lookup{} :
         moe_cache->build_lookup(*this, { il, up_exps, gate_exps, down_exps, gate_up_exps, weight_before_ffn }, selected_experts);
 
+    // MoE expert streaming: make the selected experts cache-resident and remap the ids fed to the
+    // expert GEMMs to cache slots; the routing (weights, scales, biases) keeps the original ids
+    ggml_tensor * mm_ids = nullptr;
+    if (cache.slots == nullptr && mstream != nullptr) {
+        llama_moe_stream_layer * msl = mstream->layer(il);
+        if (msl != nullptr && msl->matches(gate_exps, up_exps, down_exps, gate_up_exps)) {
+            ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
+            mm_ids = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
+            cb(mm_ids, "ffn_moe_stream_slots", il);
+        }
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -2675,7 +2689,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
 
     ggml_tensor * experts = cache.slots == nullptr ?
-        build_experts(cur, selected_experts, nullptr, true) :
+        build_experts(cur, selected_experts, mm_ids, mm_ids == nullptr) :
         moe_cache->build_experts(*this, cache, cur, selected_experts,
                 [](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached, void * user_data) {
                     return (*static_cast<decltype(build_experts) *>(user_data))(cur, ids, mm_ids, cached);

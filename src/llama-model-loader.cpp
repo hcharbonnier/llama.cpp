@@ -1270,9 +1270,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         // skip unused tensors
-        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
+        if (info.op == GGML_OP_NONE || (flags & (TENSOR_SKIP | TENSOR_STREAMED))) {
             const size_t nbytes = ggml_nbytes(t_meta);
-            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            if (flags & TENSOR_STREAMED) {
+                LLAMA_LOG_DEBUG("tensor %s is streamed from disk (size = %zu bytes)\n", tn.str().c_str(), nbytes);
+            } else {
+                LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            }
 
             size_data -= nbytes;
             n_created++;
