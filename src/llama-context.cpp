@@ -187,8 +187,9 @@ llama_context::llama_context(
         const uint32_t n_prev = ms->add_context();
         if (n_prev != 0) {
             throw std::runtime_error(format(
-                    "MoE expert streaming: model '%s' already has %u active context(s), "
-                    "only one context per streamed model is supported",
+                    "MoE expert streaming: model '%s' already has %u active context(s); "
+                    "only one context per streamed model is supported "
+                    "(destroy the other context or disable --moe-stream)",
                     model.arch_name().c_str(), n_prev));
         }
         mstream_guard.ms = ms;

@@ -1056,7 +1056,7 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
             moe_aligned_free(probe);
         }
         if (!ok) {
-            LLAMA_LOG_WARN("%s: direct I/O not usable, falling back to buffered streaming reads\n", __func__);
+            LLAMA_LOG_WARN("%s: --moe-stream-direct not usable here, falling back to buffered streaming reads\n", __func__);
             use_direct_io = false;
             open_all(false);
         }

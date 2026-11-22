@@ -174,20 +174,21 @@ struct llama_moe_stream {
     void print_stats() const;
 
     // a streamed model shares one expert cache across all its contexts, so only one context may
-    // use it at a time. add_context returns 0 on success, else the number of contexts active.
+    // use it at a time; draft/MTP contexts built on the same model are refused too.
+    // add_context returns 0 on success, else the number of contexts already active.
     uint32_t add_context() {
         std::lock_guard<std::mutex> lock(ctx_mtx);
-        const uint32_t n_prev = n_ctx;
+        const uint32_t n_prev = n_contexts;
         if (n_prev == 0) {
-            n_ctx = 1;
+            n_contexts = 1;
         }
         return n_prev;
     }
 
     void remove_context() {
         std::lock_guard<std::mutex> lock(ctx_mtx);
-        GGML_ASSERT(n_ctx > 0);
-        n_ctx--;
+        GGML_ASSERT(n_contexts > 0);
+        n_contexts--;
     }
 
     bool use_direct_io = false; // unbuffered streaming reads (--moe-stream-direct), no page cache
@@ -218,7 +219,7 @@ struct llama_moe_stream {
 
     // single-context claim: guards against concurrent contexts sharing this expert cache
     std::mutex ctx_mtx;
-    uint32_t   n_ctx = 0; // active contexts, guarded by ctx_mtx
+    uint32_t   n_contexts = 0; // active contexts, guarded by ctx_mtx
 
     // load pool (queue and all layer residency state guarded by mtx)
     mutable std::mutex      mtx;
