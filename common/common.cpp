@@ -1730,6 +1730,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_direct           = params.moe_stream_direct;
     mparams.moe_stream_ram              = params.moe_stream_ram;
     mparams.moe_stream_ram_auto         = params.moe_stream_ram_auto;
+    mparams.moe_stream_ram_hot          = params.moe_stream_ram_hot;
+    mparams.moe_stream_ram_seed         = params.moe_stream_ram_seed;
+    mparams.moe_stream_ram_prefill      = params.moe_stream_ram_prefill;
 
     return mparams;
 }

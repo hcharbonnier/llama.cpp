@@ -377,6 +377,9 @@ extern "C" {
         bool moe_stream;        // stream MoE routed expert weights from disk on demand
         bool moe_stream_direct; // use direct I/O for expert reads (bypass the page cache)
         bool moe_stream_ram_auto; // derive moe_stream_ram from available physical RAM (half of it)
+        bool moe_stream_ram_hot; // hot host tier: dynamic per-layer cache instead of a static mirror
+        bool moe_stream_ram_seed; // hot host tier: seed the dynamic cache with the static mirror content
+        bool moe_stream_ram_prefill; // hot host tier: also admit experts during prompt evaluation
     };
 
     struct llama_sampler_seq_config {
