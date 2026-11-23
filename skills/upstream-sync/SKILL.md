@@ -1,17 +1,17 @@
 ---
 name: upstream-sync
-description: Sync the fork master branch with ggml-org/llama.cpp master, replay moe-stream on the new mirror, promote master by fast-forward, run the verification invariants and publish with force-with-lease. Use for an upstream sync, when master must catch up with upstream, or when moe-stream must be replayed after the mirror moved.
+description: Sync the fork master branch with ggml-org/llama.cpp master, replay moe-stream on the new upstream mirror, promote master by fast-forward, run the verification invariants and publish with force-with-lease. Use for an upstream sync, when master must catch up with upstream, or when moe-stream must be replayed after the mirror moved.
 ---
 
 # Sync the fork master with upstream
 
 This skill is the operational companion of `.kilo/rules/upstream-sync.md`. Read that rule fully first: it is the source of truth for the branch model, the conflict policy and the invariants. This file orders the steps, adds the mandatory checkpoints and the report format, so an agent in a fresh session can run one sync end to end.
 
-A sync needs an archive of the series before the rebase, otherwise the old series becomes unreachable once the old mirror is gone. Keep the pre-sync head and the previous mirror: `git branch -f archive/moe-stream-pre-sync-$(date +%Y%m%d) $(git rev-parse moe-stream)` runs before the rebase in step 3.
+The rule is gitignored, so it is not present in a fresh clone of the fork. Keep its content in mind or copy it next to this file before working.
 
 ## Branch model
 
-All commands run in `C:\dev\git\llama.cpp` (WSL: `/c/dev/git/llama.cpp`). A Git worktree shares the branches, so the same steps work from a worktree path; `patches/` only lands in the directory that runs the export.
+All commands run in `C:\dev\git\llama.cpp` (WSL: `/mnt/c/dev/git/llama.cpp`). A Git worktree shares the branches, so the same steps work from a worktree path; `patches/` only lands in the directory that runs the export.
 
 | Branch | Role | Push rule |
 | --- | --- | --- |
@@ -34,21 +34,26 @@ Hard limits:
 - Never delete `/tmp/radiance-gpu.lock`, never kill the process that holds it.
 - When the lease fails, stop, close Checkpoint A and restart from step 1.
 - Never `git reset --hard`, never edit `upstream-mirror`, never merge `master` into `moe-stream`.
+- Never squash or drop a fork commit during the rebase.
 - Never stage machine-specific untracked paths.
 
 ## Step 1 - Record the starting state
 
 ```sh
-cd /c/dev/git/llama.cpp
+cd /mnt/c/dev/git/llama.cpp
 git status --short --branch
 git fetch origin
 OLD_MIRROR=$(git rev-parse upstream-mirror)
 OLD_REMOTE_MASTER=$(git rev-parse origin/master)
 OLD_LOCAL_MASTER=$(git rev-parse master)
-git rev-parse --short "$OLD_MIRROR" "$OLD_REMOTE_MASTER" "$OLD_LOCAL_MASTER"
+OLD_MOE=$(git rev-parse moe-stream)
+git rev-parse --short "$OLD_MIRROR" "$OLD_REMOTE_MASTER" "$OLD_LOCAL_MASTER" "$OLD_MOE"
+git branch -f archive/moe-stream-pre-sync-$(date +%Y%m%d) "$OLD_MOE"
 ```
 
-`OLD_REMOTE_MASTER` equals `OLD_LOCAL_MASTER`. A mismatch is a blocker: explain it before touching anything. Keep both hashes for the lease and the report.
+- `OLD_REMOTE_MASTER` equals `OLD_LOCAL_MASTER`. A mismatch is a blocker: explain it before touching anything.
+- Keep all four hashes for the range-diff, the lease and the report.
+- The archive branch makes the pre-sync series reachable once the rebase and the new mirror move its commits.
 
 ## Step 2 - Fetch upstream into the mirror
 
@@ -60,7 +65,10 @@ git rev-list --count "$OLD_MIRROR..$NEW_MIRROR"
 git merge-base --is-ancestor "$OLD_MIRROR" "$NEW_MIRROR" && echo "mirror fast-forwarded"
 ```
 
-The fetch stays silent when nothing changed, and silence proves nothing: compare the hashes. Equal hashes mean upstream did not move, stop and report it. `git rev-list --count "$OLD_MIRROR..$NEW_MIRROR"` of 0 confirms no upstream commit was lost. A failed ancestry test means the mirror moved backwards and needs a human decision before any rebase.
+- The fetch stays silent when nothing changed, and silence proves nothing: compare the hashes.
+- Equal hashes mean upstream did not move: stop and report it, there is nothing to sync.
+- The count is the number of upstream commits integrated, record it for the report.
+- A failed ancestry test means the mirror moved backwards: it needs a human decision before any rebase.
 
 ## Step 3 - Replay moe-stream on the new mirror
 
@@ -69,15 +77,15 @@ git switch moe-stream
 git rev-list --count upstream-mirror..moe-stream
 git rebase upstream-mirror
 git rev-list --count upstream-mirror..moe-stream
-git range-diff upstream-mirror...moe-stream
+git range-diff "$OLD_MIRROR"..archive/moe-stream-pre-sync-$(date +%Y%m%d) upstream-mirror..moe-stream
 ```
 
-- Keep the two counts: both must match, one entry per fork commit, no squash, no `--skip`.
+- Both counts must match: one entry per fork commit, nothing squashed, nothing skipped.
 - Resolve conflicts commit by commit, see the conflict policy below.
 - Replay a subset only with `git rebase --onto upstream-mirror <old-base> moe-stream`.
-- Keep the pre-replay head: `git branch -f archive/moe-stream-pre-sync-$(date +%Y%m%d) $(git rev-parse moe-stream)` before the rebase.
 - A commit that no longer builds after the replay stops the sync.
-- `git range-diff upstream-mirror...moe-stream` run after the rebase lists every commit as new (`-:  ---->`), since the mirror itself moved. The meaningful comparison is the old series against the new one: `git range-diff <old-mirror>..<old-moe-stream> upstream-mirror..moe-stream`, and `19/19` equal lines rather than `-:` lines. Record which form was used.
+- The range-diff compares the old series (archive branch) with the new one: every commit must show `=`, no `!` or `-:` line. A `-:` line means a commit was lost.
+- Do not use `git range-diff upstream-mirror...moe-stream` after the rebase: the mirror moved, so it lists every commit as new.
 
 ## Step 4 - Promote master by fast-forward
 
@@ -94,11 +102,11 @@ git log --oneline --graph -n 20 upstream-mirror..master
 
 ## Step 5 - Build and verify
 
-Every point is mandatory and every point runs before the push:
+Every point is mandatory and every point runs before the push. If the rebase or a build fails, do not push: fix, replay the series, then restart at this step.
 
 - Build CPU, in addition to the default build.
 - Build CUDA with `-DGGML_CUDA=ON`. A green CPU build alone is not a verification.
-- No CLI option without consumer: every `--moe-stream*` option parsed in `common/arg.cpp` is read in `src/`; a parsed but never-read option fails the sync.
+- No CLI option without consumer: every fork option parsed in `common/arg.cpp` is read in `src/` (for example `--moe-stream*` against `params.moe_stream`); a parsed but never-read option fails the sync.
 - No dead code shipped silently: nothing the sync left unreachable or unused.
 - No declared-but-undefined symbol: the link passes on both targets, check the CUDA link for symbols such as `ggml_cuda_zero_skipped_mul_mat_id`.
 - `ctest` green on the CPU build.
@@ -121,7 +129,7 @@ Non-regression, mandatory, on at least one MoE model:
 - The dense check (`SmolLM-135M`) and the MoE without streaming, as the previous sync did.
 - `llama-cli` is an upstream chat client: measure and compare with `llama-completion`, not `llama-cli`.
 
-Record an md5 of each output pair, not a bare "PASS".
+Record the model, the configurations and an md5 of each output pair, not a bare "PASS".
 
 ## Step 6 - Checkpoint A: approval to publish
 
@@ -195,6 +203,6 @@ The sync report contains at least:
 | ctest | pass/fail count |
 | Non-regression | model, configurations, byte-for-byte md5, CPU and CUDA, with and without waves |
 | Post-push | `ls-remote` equals the local head for `master` and `moe-stream`, clean status |
-| Archive | pre-sync branch kept for the old head, if any |
+| Archive | pre-sync branch kept for the old head |
 
 Record both hashes so the check stays reproducible. Close with what still fails or is untested, including the backends the fork does not verify (Metal, Vulkan, SYCL, ...).
