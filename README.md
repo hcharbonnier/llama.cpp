@@ -17,6 +17,33 @@
 
 </div>
 
+## This fork
+
+This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) that adds MoE expert streaming: routed expert weights are read from disk on demand, so a mixture-of-experts model can run even when its experts do not fit in VRAM or RAM. Everything else follows upstream; master is rebased on upstream and the fork commits stay on top.
+
+### Added features
+
+- Expert streaming: `--moe-stream` reads only the experts routed for the current batch, backed by a device cache (`--moe-stream-cache 8s` for 8 slots per layer, or a memory budget in GiB).
+- Host RAM mirror: `--moe-stream-ram N|auto` keeps a second copy of experts in RAM, pinned when possible; `--moe-stream-ram-policy static|hot|hot-seeded` selects the policy, and `--moe-stream-ram-prefill` admits experts during prompt evaluation.
+- Prefill waves: when a batch touches more experts than the cache holds, the expert GEMMs run in several passes, so `n_ubatch` is no longer capped to `n_slots / n_expert_used`. Long prompts gain the most.
+- Memory fit: the expert cache is accounted for by `--fit`, which reduces `n_gpu_layers` instead of failing with an out-of-memory error.
+- Direct I/O: `--moe-stream-direct` bypasses the page cache for expert reads (POSIX verified; the Windows path is implemented but not yet validated with MSVC).
+- Diagnostics: hit, miss, load and eviction counters are printed at shutdown, and `LLAMA_MOE_STREAM_TRACE=1` logs one line per expert remap call.
+
+```sh
+llama-cli -m model.gguf --moe-stream --moe-stream-cache 8s --moe-stream-ram 32G -p "Hello"
+```
+
+### Known limits
+
+- One `llama_context` per streamed model; a second context is refused with an explicit error.
+- `--moe-stream-pin` is not ported and fails at startup.
+- Streaming is slower than fully resident weights. Measured on a 2-layer, 16-expert slice: prompt processing x14.8 on CPU and x18.7 on CUDA versus the capped baseline, decode +2.6% to +3.6%.
+- The skipped-slot path (`-1` ids) is covered by the CPU and CUDA backends; Metal, Vulkan, SYCL, CANN, OpenCL and WebGPU are not validated, and native Windows builds are not validated.
+- Outputs are byte-identical with and without streaming in every tested configuration.
+
+---
+
 ## Description
 
 The main goal of `llama.cpp` is to enable LLM (and MLLM) inference with minimal setup and state-of-the-art performance on a wide range of hardware - locally and in the cloud.
