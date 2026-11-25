@@ -1939,14 +1939,11 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
         return 0;
     }
 
-    if (n_slots < 2) {
-        LLAMA_LOG_WARN("%s: MoE expert streaming has only %u slot; multi-pass prefill needs at least 2 -- n_ubatch will be capped\n",
-                __func__, n_slots);
-    } else if (n_slots < 2*hparams.n_expert_used_max()) {
-        // two waves need 2*n_expert_used slots to keep a full token's routes per wave; with fewer
-        // slots a wave holds fewer experts than n_expert_used and a token's routes span waves
-        LLAMA_LOG_WARN("%s: MoE expert cache has %u slots < 2*n_expert_used (%u): multi-pass prefill splits each token's routes across waves\n",
-                __func__, n_slots, 2*hparams.n_expert_used_max());
+    // multi-pass prefill holds 2*n_expert_used slots per wave; a smaller cache makes a token's
+    // routes span waves and the CPU MUL_MAT_ID sums them in a different order, so refuse it
+    if (n_slots < 2*hparams.n_expert_used_max()) {
+        throw std::runtime_error(format("%s: MoE expert cache gives %u slots per layer, but at least %u (2*n_expert_used) are needed; increase --moe-stream-cache",
+                __func__, n_slots, 2*hparams.n_expert_used_max()));
     }
 
     return n_slots;
