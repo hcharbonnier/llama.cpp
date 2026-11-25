@@ -897,17 +897,17 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     parse_cli_args();
 
     // reject incompatible options before any model download or allocation
-    if (params.moe_stream) {
+    if (params.moe_stream.enabled) {
         if (params.moe_cache_size > 0) {
             throw std::invalid_argument("error: --moe-stream cannot be used with --moe-cache-mib\n");
         }
         if (!params.lora_adapters.empty()) {
             throw std::invalid_argument("error: --moe-stream does not support --lora adapters\n");
         }
-        if (params.moe_stream_ram_prefill && !params.moe_stream_ram_hot) {
+        if (params.moe_stream.ram_prefill && !params.moe_stream.ram_hot) {
             throw std::invalid_argument("error: --moe-stream-ram-prefill requires --moe-stream-ram-policy hot or hot-seeded\n");
         }
-        if (params.moe_stream_ram_hot && params.moe_stream_ram == 0 && !params.moe_stream_ram_auto) {
+        if (params.moe_stream.ram_hot && params.moe_stream.ram == 0 && !params.moe_stream.ram_auto) {
             throw std::invalid_argument("error: --moe-stream-ram-policy hot requires --moe-stream-ram N|auto\n");
         }
     }
@@ -2789,14 +2789,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-stream"},
         "stream Mixture of Experts (MoE) routed expert weights from disk on demand",
         [](common_params & params) {
-            params.moe_stream = true;
+            params.moe_stream.enabled = true;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM"));
     add_opt(common_arg(
         {"--moe-stream-cache"}, "<NG|Ns>",
         "expert cache for --moe-stream: memory budget in GiB (e.g. 40) or exact slots per layer with an 's' suffix (e.g. 64s); implies --moe-stream (default: auto)",
         [](common_params & params, const std::string & value) {
-            params.moe_stream = true;
+            params.moe_stream.enabled = true;
             if (value.empty() || value[0] == '-') {
                 throw std::invalid_argument("invalid value, expected <NG|Ns> (e.g. 40 or 64s)");
             }
@@ -2818,14 +2818,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 if (n > 0xffffffffull) {
                     throw std::invalid_argument("invalid value, too many slots per layer");
                 }
-                params.moe_stream_slots  = (uint32_t) n;
-                params.moe_stream_budget = 0;
+                params.moe_stream.slots  = (uint32_t) n;
+                params.moe_stream.budget = 0;
             } else if (suffix.empty() || suffix == "g" || suffix == "gb" || suffix == "gib") {
                 if (n > 0xffffffffffffffffull/1024ull/1024ull/1024ull) {
                     throw std::invalid_argument("invalid value, budget is too large");
                 }
-                params.moe_stream_budget = n * 1024ull * 1024ull * 1024ull;
-                params.moe_stream_slots  = 0;
+                params.moe_stream.budget = n * 1024ull * 1024ull * 1024ull;
+                params.moe_stream.slots  = 0;
             } else {
                 throw std::invalid_argument("invalid value, expected <NG|Ns> (e.g. 40 or 64s)");
             }
@@ -2835,11 +2835,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-stream-io-threads"}, "N",
         "I/O threads for --moe-stream expert loads; implies --moe-stream (default: auto)",
         [](common_params & params, int value) {
-            params.moe_stream = true;
+            params.moe_stream.enabled = true;
             if (value < 1 || value > 32) {
                 throw std::invalid_argument("invalid value, I/O threads must be between 1 and 32");
             }
-            params.moe_stream_io_threads = value;
+            params.moe_stream.io_threads = value;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_IO_THREADS"));
     add_opt(common_arg(
@@ -2847,8 +2847,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "use direct I/O for --moe-stream expert reads (bypass the page cache); implies --moe-stream. "
         "falls back to buffered reads if direct I/O is unsupported by the OS or filesystem",
         [](common_params & params) {
-            params.moe_stream = true;
-            params.moe_stream_direct = true;
+            params.moe_stream.enabled = true;
+            params.moe_stream.direct = true;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_DIRECT"));
     add_opt(common_arg(
@@ -2857,10 +2857,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "as a static mirror by default or as a dynamic cache with --moe-stream-ram-policy hot; 'auto' uses "
         "half of the available physical RAM; implies --moe-stream (default: 0, disabled)",
         [](common_params & params, const std::string & value) {
-            params.moe_stream = true;
+            params.moe_stream.enabled = true;
             if (value == "auto") {
-                params.moe_stream_ram_auto = true;
-                params.moe_stream_ram      = 0;
+                params.moe_stream.ram_auto = true;
+                params.moe_stream.ram      = 0;
                 return;
             }
             if (value.empty() || value[0] == '-') {
@@ -2892,8 +2892,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (n > UINT64_MAX/mult) {
                 throw std::invalid_argument("invalid value, budget is too large");
             }
-            params.moe_stream_ram_auto = false;
-            params.moe_stream_ram      = n*mult;
+            params.moe_stream.ram_auto = false;
+            params.moe_stream.ram      = n*mult;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_RAM"));
     // the hot policy and prefill admission are opt-in; pinning is not part of this iteration:
@@ -2905,16 +2905,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "'hot' keeps a dynamic cache filled on device misses, 'hot-seeded' starts that cache from the static "
             "mirror content; hot policies require --moe-stream-ram",
             [](common_params & params, const std::string & value) {
-                params.moe_stream = true;
+                params.moe_stream.enabled = true;
                 if (value == "static") {
-                    params.moe_stream_ram_hot  = false;
-                    params.moe_stream_ram_seed = false;
+                    params.moe_stream.ram_hot  = false;
+                    params.moe_stream.ram_seed = false;
                 } else if (value == "hot") {
-                    params.moe_stream_ram_hot  = true;
-                    params.moe_stream_ram_seed = false;
+                    params.moe_stream.ram_hot  = true;
+                    params.moe_stream.ram_seed = false;
                 } else if (value == "hot-seeded") {
-                    params.moe_stream_ram_hot  = true;
-                    params.moe_stream_ram_seed = true;
+                    params.moe_stream.ram_hot  = true;
+                    params.moe_stream.ram_seed = true;
                 } else {
                     throw std::invalid_argument("invalid value, expected static, hot or hot-seeded");
                 }
@@ -2925,8 +2925,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "admit experts into the --moe-stream hot host cache during prompt evaluation; "
             "requires --moe-stream-ram-policy hot or hot-seeded",
             [](common_params & params) {
-                params.moe_stream = true;
-                params.moe_stream_ram_prefill = true;
+                params.moe_stream.enabled = true;
+                params.moe_stream.ram_prefill = true;
             }
         ).set_env("LLAMA_ARG_MOE_STREAM_RAM_PREFILL"));
         add_opt(common_arg(

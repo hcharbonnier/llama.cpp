@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-moe-stream.h"
+#include "llama-moe-stream-params.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 
@@ -1886,10 +1887,10 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
         return 0;
     }
 
-    uint32_t n_slots = params.moe_stream_slots;
+    uint32_t n_slots = params.moe_stream->slots;
 
     bool cache_from_budget = false;
-    if (n_slots == 0 && params.moe_stream_budget > 0) {
+    if (n_slots == 0 && params.moe_stream->budget > 0) {
         // derive the per-layer slot count from the total byte budget
         size_t nb_expert_sum = 0; // bytes of one expert across every streamable layer
         for (const auto & [name, w] : ml.weights_map) {
@@ -1898,14 +1899,14 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
             }
         }
         if (nb_expert_sum > 0) {
-            const uint64_t slots_budget = params.moe_stream_budget/nb_expert_sum;
+            const uint64_t slots_budget = params.moe_stream->budget/nb_expert_sum;
             n_slots = (uint32_t) std::min<uint64_t>(
                     std::max<uint64_t>(slots_budget, hparams.n_expert_used_max()), hparams.n_expert);
             cache_from_budget = true;
         }
     }
 
-    const bool cache_from_params = params.moe_stream_slots > 0 || cache_from_budget;
+    const bool cache_from_params = params.moe_stream->slots > 0 || cache_from_budget;
 
     if (n_slots == 0) {
         n_slots = std::max<uint32_t>(2*hparams.n_expert_used_max(), 16);
@@ -2067,7 +2068,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
-    if (params.moe_stream) {
+    if (params.moe_stream && params.moe_stream->enabled) {
         if (ml.files.empty()) {
             // fail before allocating anything: the stream engine reads expert slabs by offset
             throw std::runtime_error(format("%s: MoE expert streaming requires a file-based model", __func__));
@@ -2083,12 +2084,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (pimpl->has_tensor_overrides) {
                 LLAMA_LOG_WARN("%s: tensor buffer overrides (-ot/--cpu-moe) do not apply to streamed expert tensors\n", __func__);
             }
-            if (params.moe_stream_ram_hot && params.moe_stream_ram == 0 && !params.moe_stream_ram_auto) {
+            if (params.moe_stream->ram_hot && params.moe_stream->ram == 0 && !params.moe_stream->ram_auto) {
                 throw std::runtime_error(format("%s: MoE host cache policy hot requires a --moe-stream-ram budget", __func__));
             }
-            pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream_io_threads, params.moe_stream_direct,
-                    params.moe_stream_ram, params.moe_stream_ram_auto, params.moe_stream_ram_hot,
-                    params.moe_stream_ram_seed, params.moe_stream_ram_prefill);
+            pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream->io_threads, params.moe_stream->direct,
+                    params.moe_stream->ram, params.moe_stream->ram_auto, params.moe_stream->ram_hot,
+                    params.moe_stream->ram_seed, params.moe_stream->ram_prefill);
             LLAMA_LOG_INFO("%s: MoE expert streaming enabled, %u of %u experts cached per layer, %d I/O threads\n",
                     __func__, n_slots, hparams.n_expert, pimpl->moe_stream->n_io_threads);
         }
@@ -4031,10 +4032,7 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
-        /*.moe_stream_slots            =*/ 0,
-        /*.moe_stream_budget           =*/ 0,
-        /*.moe_stream_io_threads       =*/ 0,
-        /*.moe_stream_ram              =*/ 0,
+        /*.moe_stream                  =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
@@ -4044,12 +4042,6 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
-        /*.moe_stream                  =*/ false,
-        /*.moe_stream_direct           =*/ false,
-        /*.moe_stream_ram_auto         =*/ false,
-        /*.moe_stream_ram_hot          =*/ false,
-        /*.moe_stream_ram_seed         =*/ false,
-        /*.moe_stream_ram_prefill      =*/ false,
     };
 
     return result;

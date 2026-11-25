@@ -328,6 +328,8 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    struct llama_moe_stream_params;
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -347,14 +349,8 @@ extern "C" {
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
-        // expert cache slots per streamed MoE layer (0 = auto)
-        uint32_t moe_stream_slots;
-        // total expert cache byte budget, used when moe_stream_slots == 0 (0 = auto)
-        uint64_t moe_stream_budget;
-        // expert load I/O threads (<= 0 = default)
-        int32_t moe_stream_io_threads;
-        // static host mirror byte budget for the experts the cache does not hold (0 = disabled)
-        uint64_t moe_stream_ram;
+        // MoE expert streaming configuration, NULL = disabled
+        const struct llama_moe_stream_params * moe_stream;
 
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
         // If the provided progress_callback returns true, model loading continues.
@@ -374,12 +370,6 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
-        bool moe_stream;        // stream MoE routed expert weights from disk on demand
-        bool moe_stream_direct; // use direct I/O for expert reads (bypass the page cache)
-        bool moe_stream_ram_auto; // derive moe_stream_ram from available physical RAM (half of it)
-        bool moe_stream_ram_hot; // hot host tier: dynamic per-layer cache instead of a static mirror
-        bool moe_stream_ram_seed; // hot host tier: seed the dynamic cache with the static mirror content
-        bool moe_stream_ram_prefill; // hot host tier: also admit experts during prompt evaluation
     };
 
     struct llama_sampler_seq_config {
@@ -1749,9 +1739,6 @@ extern "C" {
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
-
-    // print MoE expert streaming statistics (no-op when streaming is not enabled)
-    LLAMA_API void llama_moe_stream_print_stats(const struct llama_model * model);
 
     //
     // training

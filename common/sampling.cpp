@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "fit.h"
+#include "llama-moe-stream-params.h"
 #include "log.h"
 #include "reasoning-budget.h"
 

@@ -7,6 +7,7 @@
 #include "ggml-opt.h"
 #include "ggml.h"
 #include "llama.h"
+#include "llama-moe-stream-params.h"
 
 #include <array>
 #include <list>
@@ -619,16 +620,7 @@ struct common_params {
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
 
-    bool     moe_stream            = false; // stream MoE routed expert weights from disk on demand
-    uint32_t moe_stream_slots      = 0;     // expert cache slots per streamed layer (0 = auto)
-    uint64_t moe_stream_budget     = 0;     // total expert cache byte budget, used when slots == 0 (0 = auto)
-    int32_t  moe_stream_io_threads = 0;     // expert load I/O threads (<= 0 = default)
-    uint64_t moe_stream_ram        = 0;     // static host mirror byte budget for the experts the cache does not hold
-    bool     moe_stream_ram_auto   = false; // derive the host mirror budget from available physical RAM
-    bool     moe_stream_ram_hot    = false; // hot host tier: dynamic per-layer cache instead of a static mirror
-    bool     moe_stream_ram_seed   = false; // hot host tier: seed the dynamic cache from the static mirror content
-    bool     moe_stream_ram_prefill = false; // hot host tier: also admit experts during prompt evaluation
-    bool     moe_stream_direct     = false; // use direct I/O for expert reads (bypass page cache)
+    llama_moe_stream_params moe_stream = {}; // MoE expert streaming configuration
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
