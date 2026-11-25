@@ -23,6 +23,31 @@ History is linear (rebase), so every master update rewrites published history.
 
 Also read `.kilo/rules/remote-machine-ai.md` (GPU host, `flock`) and `.kilo/rules/agent-workflow.md` (a history rewrite or a publication is a user checkpoint).
 
+## Automated harness: `scripts/fork-sync-check.sh`
+
+`scripts/fork-sync-check.sh` automates the mechanical parts of this procedure. It is non-interactive, ASCII, uses `set -euo pipefail`, and never merges, switches branches, pushes or rewrites history.
+
+```sh
+# Enable rerere, fetch upstream into upstream-mirror, compare hashes before/after,
+# print the range-diff command. It only sets config and fetches.
+scripts/fork-sync-check.sh sync-prep
+
+# Build CPU (Ninja) and CUDA (-DGGML_CUDA=ON).
+scripts/fork-sync-check.sh build
+
+# Non-regression: llama-completion streaming vs non-streaming, byte for byte, on
+# CPU and CUDA, plus ctest test-arg-parser and test-llama-mmap.
+scripts/fork-sync-check.sh check --model models/moe.gguf
+
+# GPU parts on the ai host over SSH, under flock, per remote-machine-ai.md.
+scripts/fork-sync-check.sh check --model models/moe.gguf \
+  --remote --remote-model /opt/agent-ia/models/moe.gguf
+```
+
+Defaults: `BUILD_CPU=build-cpu`, `BUILD_CUDA=build-cuda`, `BINARY=llama-completion`, `STREAM_ARGS=--moe-stream`, `CTEST_REGEX=^(test-arg-parser|test-llama-mmap)$`. Every default is overridable by flag or by the matching environment variable; `--help` lists them. The suite keeps both outputs and their md5 in `--out-dir`, prints a PASS/FAIL summary, and exits non-zero on any failure. `--remote` copies the script to `/tmp`, runs the CUDA pair inside `flock -w 7200 /tmp/radiance-gpu.lock`, and requires `--remote-model`.
+
+The script does not replace Checkpoint A or B: it collects the evidence, the human decides. Full builds and GPU runs happen on `ai`, not on this workstation.
+
 ## Checkpoints (mandatory)
 
 - Checkpoint A: before the push. Show the recorded hashes, the commit counts, the range-diff and the verification results, then wait for explicit human approval. The push rewrites the published history of `master`.
@@ -69,6 +94,8 @@ git merge-base --is-ancestor "$OLD_MIRROR" "$NEW_MIRROR" && echo "mirror fast-fo
 - Equal hashes mean upstream did not move: stop and report it, there is nothing to sync.
 - The count is the number of upstream commits integrated, record it for the report.
 - A failed ancestry test means the mirror moved backwards: it needs a human decision before any rebase.
+
+`scripts/fork-sync-check.sh sync-prep` performs the rerere setup, the fetch and the hash comparison, then prints the range-diff command. It never creates the archive branch, never rebases and never pushes; run those steps by hand.
 
 ## Step 3 - Replay moe-stream on the new mirror
 
@@ -119,6 +146,8 @@ ctest --test-dir build-cpu --output-on-failure
 cmake -B build-cuda -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
 cmake --build build-cuda --config Release -j
 ```
+
+`scripts/fork-sync-check.sh build` runs the two build sequences (Ninja), and `scripts/fork-sync-check.sh check --model <moe.gguf>` runs the byte-for-byte CPU and CUDA pairs plus the two ctest cases. Use `--remote --remote-model ...` for the CUDA half on `ai`. Record the md5 printed by the script for each pair.
 
 The local builds do not approve the GPU. The CUDA run follows `.kilo/rules/remote-machine-ai.md`: copy the repository state to the GPU host, never reuse an untracked working tree there, and run every GPU command under `flock -w 7200 /tmp/radiance-gpu.lock`.
 
