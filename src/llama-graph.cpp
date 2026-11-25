@@ -2582,14 +2582,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (cache.slots == nullptr && msl != nullptr) {
         const uint64_t n_touch_max = std::min<uint64_t>((uint64_t) n_expert, (uint64_t) n_tokens*n_expert_used);
         if (n_touch_max > msl->n_slots) {
-            // the cache must hold two sets at once: this wave's experts and the next wave's
-            //   preloaded experts (so its loads overlap this wave's compute), so cap = n_slots/2
+            // the cache holds n_slots experts; a wave holds half of them so the next wave can be
+            // preloaded beside it. n_slots >= 2*n_expert_used at load keeps a wave above one
+            // token's routes, so a token's partial sums stay in its own wave
             stream_wave_cap = msl->n_slots/2;
-            if (stream_wave_cap >= 1) {
-                n_stream_waves = (uint32_t) ((n_touch_max + stream_wave_cap - 1)/stream_wave_cap);
-            } else {
-                stream_wave_cap = 0; // n_slots < 2: no room for two waves, keep the ubatch cap
-            }
+            n_stream_waves = (uint32_t) ((n_touch_max + stream_wave_cap - 1)/stream_wave_cap);
         }
         if (n_stream_waves == 1) {
             ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view

@@ -1882,6 +1882,12 @@ static bool llama_moe_stream_is_exps_name(const std::string & name) {
 // resolve the per-layer expert cache slot count; returns 0 when streaming should not be enabled
 // (not a MoE model, or the cache would hold every expert anyway)
 static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params, const llama_hparams & hparams, const llama_model_loader & ml) {
+    if (ml.no_alloc) {
+        // metadata-only load: the model is only flattened into tensors and no context uses the
+        // experts, so streaming never runs; do not reject a cache based on synthetic hparams
+        return 0;
+    }
+
     if (hparams.n_expert == 0 || hparams.n_expert_used_max() == 0) {
         LLAMA_LOG_WARN("%s: MoE expert streaming requires a MoE model -- disabled\n", __func__);
         return 0;
@@ -1922,25 +1928,23 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
     }
 
     if (n_slots < n_slots_min) {
-        if (cache_from_params) {
-            // an explicit --moe-stream-cache is a hard budget: fail at load instead of hitting
-            // the graph-build abort on the first batch that needs more slots
-            throw std::runtime_error(format("%s: --moe-stream-cache gives %u slots per layer, but at least %u (n_expert_used) are needed; increase --moe-stream-cache",
-                    __func__, n_slots, n_slots_min));
-        }
-        LLAMA_LOG_WARN("%s: raising MoE expert cache from %u to %u slots (n_expert_used)\n",
-                __func__, n_slots, n_slots_min);
-        n_slots = n_slots_min;
+        // a ubatch must hold every distinct expert of a decode step; fail instead of raising the
+        // cache behind the user's back, the graph-build abort would come on the first batch anyway
+        throw std::runtime_error(format("%s: MoE expert cache gives %u slots per layer, but at least %u (n_expert_used) are needed; increase --moe-stream-cache",
+                __func__, n_slots, n_slots_min));
     }
 
     if (n_slots >= hparams.n_expert) {
-        LLAMA_LOG_WARN("%s: MoE expert cache of %u slots covers all %u experts -- streaming disabled, loading normally\n",
-                __func__, n_slots, hparams.n_expert);
+        const char * why = !cache_from_params ? " (auto size, raise --moe-stream-cache to stream fewer experts)" :
+                          params.moe_stream->slots > 0 ? " (lower --moe-stream-cache)" : " (lower the --moe-stream-cache budget)";
+        LLAMA_LOG_WARN("%s: MoE expert cache of %u slots covers all %u experts -- streaming disabled, loading normally%s\n",
+                __func__, n_slots, hparams.n_expert, why);
         return 0;
     }
 
-    // multi-pass prefill holds 2*n_expert_used slots per wave; a smaller cache makes a token's
-    // routes span waves and the CPU MUL_MAT_ID sums them in a different order, so refuse it
+    // multi-pass prefill runs two waves and needs 2*n_expert_used slots per layer; with fewer slots
+    // a wave holds less than one token's routes and the CPU MUL_MAT_ID adds the partial sums of a
+    // token in another order, so the output would drift
     if (n_slots < 2*hparams.n_expert_used_max()) {
         throw std::runtime_error(format("%s: MoE expert cache gives %u slots per layer, but at least %u (2*n_expert_used) are needed; increase --moe-stream-cache",
                 __func__, n_slots, 2*hparams.n_expert_used_max()));

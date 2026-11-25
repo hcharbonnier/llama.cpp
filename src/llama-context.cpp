@@ -373,9 +373,9 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     // MoE expert streaming: ubatches that touch more distinct experts than the cache holds run the
-    // expert GEMMs in multiple waves, so the ubatch size is not capped. Only when the cache cannot
-    // hold two waves (n_slots < 2) keep the old cap: one ubatch must then touch at most n_slots
-    // experts, i.e. n_slots/n_expert_used tokens.
+    // expert GEMMs in multiple waves, so the ubatch size is not capped. A wave holds n_slots/2
+    // experts to leave room for preloading the next one, so the ubatch must still touch at most
+    // n_slots experts in total, i.e. n_slots/n_expert_used tokens.
     if (model.moe_stream() != nullptr) {
         if (!cparams.causal_attn) {
             throw std::runtime_error("MoE expert streaming is not supported with non-causal attention (encoders/embeddings)");
@@ -383,21 +383,16 @@ llama_context::llama_context(
 
         const uint32_t n_slots       = model.moe_stream()->n_slots;
         const uint32_t n_expert_used = std::max<uint32_t>(model.hparams.n_expert_used_max(), 1);
+        const uint32_t n_ubatch_max  = std::max<uint32_t>(n_slots / n_expert_used, 1);
 
-        if (n_slots >= 2) {
-            LLAMA_LOG_INFO("%s: MoE expert streaming with %u cache slots: multi-pass expert GEMMs used when a ubatch touches more experts, n_ubatch = %u\n",
-                    __func__, n_slots, cparams.n_ubatch);
-        } else {
-            const uint32_t n_ubatch_max = std::max<uint32_t>(n_slots / n_expert_used, 1);
-            LLAMA_LOG_WARN("%s: MoE expert streaming has only %u slot(s), too few for multi-pass expert GEMMs; capping n_ubatch to %u\n",
-                    __func__, n_slots, n_ubatch_max);
-            if (cparams.n_seq_max > n_ubatch_max) {
-                throw std::runtime_error(format("%s: MoE expert streaming has %u slots per layer, enough for %u token(s) per ubatch, but n_seq_max = %u; increase --moe-stream-cache",
-                        __func__, n_slots, n_ubatch_max, cparams.n_seq_max));
-            }
-            if (cparams.n_ubatch > n_ubatch_max) {
-                cparams.n_ubatch = n_ubatch_max;
-            }
+        LLAMA_LOG_INFO("%s: MoE expert streaming with %u cache slots: multi-pass expert GEMMs used when a ubatch touches more experts, n_ubatch = %u\n",
+                __func__, n_slots, std::min(cparams.n_ubatch, n_ubatch_max));
+        if (cparams.n_seq_max > n_ubatch_max) {
+            throw std::runtime_error(format("%s: MoE expert streaming has %u slots per layer, enough for %u token(s) per ubatch, but n_seq_max = %u; increase --moe-stream-cache",
+                    __func__, n_slots, n_ubatch_max, cparams.n_seq_max));
+        }
+        if (cparams.n_ubatch > n_ubatch_max) {
+            cparams.n_ubatch = n_ubatch_max;
         }
     }
 
