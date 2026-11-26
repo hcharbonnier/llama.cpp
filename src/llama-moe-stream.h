@@ -71,6 +71,7 @@ struct llama_moe_stream_layer {
     int32_t  il       = -1;
     uint32_t n_expert = 0;
     uint32_t n_slots  = 0;
+    uint32_t n_route_per_token = 0; // n_expert_used of this layer, for the admission message
 
     std::vector<llama_moe_stream_weight> weights; // 2 (fused gate_up + down) or 3 entries
 
@@ -108,6 +109,20 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t> expert_wave; // [n_expert] wave of each touched expert, 0xff = untouched
     std::vector<std::unique_ptr<llama_moe_stream_wave>> wave_ud; // stable per-wave userdata
 
+    // the docs shared by the load-time checks and the deterministic test - keep in sync with the
+    // wave decision in llm_graph_context::build_moe_ffn and with emit_wave_slots
+
+    // place each distinct touched expert (ids of n_tok tokens, n_used routes each) in its wave:
+    // consecutive first-use order, plan_capacity experts per wave. Returns the number of waves.
+    // uniq (n_expert) receives the distinct experts in first-use order, 0xff marks an expert that
+    // the ubatch does not touch.
+    static uint32_t plan_waves(const int32_t * ids, int64_t n_tok, uint32_t n_used, uint32_t n_expert,
+            uint32_t plan_capacity, std::vector<uint8_t> & expert_wave, std::vector<int32_t> & uniq);
+
+    // write out the slot id of each pair owned by wave w, -1 for the pairs of the other waves
+    static void emit_wave_slots(const std::vector<uint8_t> & expert_wave, const int32_t * ids,
+            const int32_t * expert_slot, int32_t * out, int32_t w, uint32_t n_used, int64_t n_tok);
+
     // stable userdata for wave w (grows lazily); called at graph build time only
     llama_moe_stream_wave * wave_userdata(int32_t wave, uint32_t capacity);
 
@@ -135,7 +150,7 @@ struct llama_moe_stream {
     std::vector<std::unique_ptr<llama_moe_stream_layer>> layers; // [n_layer], null = not streamed
 
     llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct,
-            uint64_t ram_budget, bool ram_auto, bool ram_hot, bool ram_seed, bool ram_prefill);
+            uint64_t ram_budget, bool ram_auto, bool ram_hot, bool ram_seed, bool ram_prefill, bool waves);
     ~llama_moe_stream();
 
     llama_moe_stream_layer * find_layer(const ggml_tensor * gate, const ggml_tensor * up,
@@ -144,7 +159,7 @@ struct llama_moe_stream {
     // registers a streamed weight of layer il and returns its cache tensor
     ggml_tensor * create_cache_tensor(
             int32_t il, ggml_backend_buffer_type_t buft, const ggml_tensor * meta,
-            uint16_t file_idx, size_t offs);
+            uint16_t file_idx, size_t offs, uint32_t n_route_per_token);
 
     // allocate the cache tensor buffers (after all create_cache_tensor calls)
     void alloc_bufs(bool no_alloc);
@@ -198,6 +213,7 @@ struct llama_moe_stream {
     bool     ram_hot     = false; // --moe-stream-ram-policy hot: dynamic host cache, not a static mirror
     bool     ram_seed    = false; // hot-seeded: start from the static mirror content
     bool     ram_prefill = false; // --moe-stream-ram-prefill: admit during prompt evaluation too
+    bool     waves       = false; // --moe-stream-waves: multi-wave expert GEMMs, not bit-exact on CPU (MUL_MAT_ID chunking)
     std::atomic<bool> prefill_active{false}; // set by the context around multi-token decode calls
     std::vector<ggml_backend_buffer_ptr> host_bufs;
 
@@ -268,7 +284,7 @@ struct llama_moe_stream {
     void update_hotness_locked(llama_moe_stream_layer & sl); // bump touched experts, decay periodically
 
     // multi-pass prefill internals (all under mtx)
-    void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n);
+    void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n_tok, uint32_t n_used);
     void stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl,
             int32_t wave, bool host_admit);
     void emit_wave_slots(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out,

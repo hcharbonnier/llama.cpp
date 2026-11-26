@@ -1950,6 +1950,16 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
                 __func__, n_slots, 2*hparams.n_expert_used_max()));
     }
 
+    // a wave holds n_slots/2 experts, so every layer's routes must fit one wave; a layer above the
+    // model maximum would split a token's routes across waves, so check each layer explicitly
+    for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
+        const uint32_t n_used = hparams.n_expert_used(il);
+        if (n_used > std::max<uint32_t>(n_slots/2, 1)) {
+            throw std::runtime_error(format("%s: layer %u routes %u experts per token, but a wave holds only %u of %u slots; increase --moe-stream-cache",
+                    __func__, il, n_used, std::max<uint32_t>(n_slots/2, 1), n_slots));
+        }
+    }
+
     return n_slots;
 }
 
@@ -2090,7 +2100,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream->io_threads, params.moe_stream->direct,
                     params.moe_stream->ram, params.moe_stream->ram_auto, params.moe_stream->ram_hot,
-                    params.moe_stream->ram_seed, params.moe_stream->ram_prefill);
+                    params.moe_stream->ram_seed, params.moe_stream->ram_prefill, params.moe_stream->waves);
             LLAMA_LOG_INFO("%s: MoE expert streaming enabled, %u of %u experts cached per layer, %d I/O threads\n",
                     __func__, n_slots, hparams.n_expert, pimpl->moe_stream->n_io_threads);
         }
@@ -2925,7 +2935,8 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
                 throw std::runtime_error(format("failed to find a buffer type for streamed tensor %s", name.c_str()));
             }
 
-            return pimpl->moe_stream->create_cache_tensor(tn.bid, buft, w->tensor, w->idx, w->offs);
+            return pimpl->moe_stream->create_cache_tensor(tn.bid, buft, w->tensor, w->idx, w->offs,
+                    std::max<uint32_t>(hparams.n_expert_used(tn.bid), 1));
         }
     }
 

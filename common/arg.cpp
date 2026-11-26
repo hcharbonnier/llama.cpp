@@ -2832,6 +2832,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_CACHE"));
     add_opt(common_arg(
+        {"--moe-stream-waves"},
+        "allow --moe-stream multi-wave expert GEMMs when a ubatch touches more experts than the cache holds; "
+        "faster prompts, but the output can drift from the non-streaming run on CPU (see docs/moe-stream-waves-exactness-20261126.md); "
+        "implies --moe-stream (default: disabled)",
+        [](common_params & params) {
+            params.moe_stream.enabled = true;
+            params.moe_stream.waves   = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_WAVES"));
+    add_opt(common_arg(
         {"--moe-stream-io-threads"}, "N",
         "I/O threads for --moe-stream expert loads; implies --moe-stream (default: auto)",
         [](common_params & params, int value) {

@@ -267,9 +267,9 @@ llama_moe_stream_layer * llama_moe_stream::find_layer(
 
 // sizes the per-layer table and clamps the I/O thread count; workers are spawned lazily on first use
 llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct,
-        uint64_t ram_budget, bool ram_auto, bool ram_hot, bool ram_seed, bool ram_prefill)
+        uint64_t ram_budget, bool ram_auto, bool ram_hot, bool ram_seed, bool ram_prefill, bool waves)
         : n_slots(n_slots), ram_budget(ram_budget), ram_auto(ram_auto), ram_hot(ram_hot),
-          ram_seed(ram_seed), ram_prefill(ram_prefill) {
+          ram_seed(ram_seed), ram_prefill(ram_prefill), waves(waves) {
     layers.resize(n_layer);
 
     this->n_io_threads = n_io_threads <= 0 ? MOE_STREAM_IO_THREADS_DEFAULT : n_io_threads;
@@ -298,7 +298,7 @@ llama_moe_stream::~llama_moe_stream() {
 
 ggml_tensor * llama_moe_stream::create_cache_tensor(
         int32_t il, ggml_backend_buffer_type_t buft, const ggml_tensor * meta,
-        uint16_t file_idx, size_t offs) {
+        uint16_t file_idx, size_t offs, uint32_t n_route_per_token) {
     GGML_ASSERT(il >= 0 && (size_t) il < layers.size());
     GGML_ASSERT(ggml_is_contiguous(meta));
     GGML_ASSERT(meta->ne[2] > 0 && meta->ne[3] == 1);
@@ -347,6 +347,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         sl->route_hotness.resize(n_expert, 0);
         sl->expert_slot  .resize(n_expert, -1);
         sl->keep         .resize(n_slots, 0);
+        sl->n_route_per_token = n_route_per_token;
     }
     GGML_ASSERT(sl->n_expert == n_expert);
 
@@ -1484,10 +1485,18 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         }
     }
 
+    // admission check: the single-pass remap loads every distinct expert of the ubatch at once. Done
+    // before any eviction or load, so a ubatch that does not fit fails cleanly with nothing touched
     if (sl->uniq.size() > sl->n_slots) {
-        GGML_ABORT("MoE expert streaming: layer %d needs %zu distinct experts but the cache has only %u slots; "
-                   "increase --moe-stream-cache or reduce the ubatch size (-ub)",
-                sl->il, sl->uniq.size(), sl->n_slots);
+        const size_t n_distinct = sl->uniq.size();
+        const size_t n_rec      = std::min<size_t>((n_distinct*5 + 3)/4, sl->n_expert); // +25%, capped at n_expert
+        const size_t n_tok      = n/std::max<uint32_t>(sl->n_route_per_token, 1);
+        LLAMA_LOG_ERROR("%s: MoE expert streaming: layer %d ubatch touches %zu distinct experts but the cache has %u slots per layer\n",
+                __func__, sl->il, n_distinct, sl->n_slots);
+        GGML_ABORT("MoE expert streaming: a ubatch of %zu tokens on layer %d routes to %zu distinct experts, more than the %u cache slots; "
+                   "raise --moe-stream-cache to %zus (at least %zu), or keep the ubatch at %u tokens or less, "
+                   "or pass --moe-stream-waves (faster, not bit-exact on CPU)",
+                n_tok, sl->il, n_distinct, sl->n_slots, n_rec, n_distinct, sl->n_slots);
     }
 
     // routing trace (off by default); n = number of router ids, so a single-token decode call has n == n_expert_used
@@ -1591,35 +1600,62 @@ llama_moe_stream_wave * llama_moe_stream_layer::wave_userdata(int32_t wave, uint
     return wave_ud[wave].get();
 }
 
+// splits the touched experts of a ubatch into waves: consecutive first-use order, plan_capacity
+// experts per wave. Returns the number of waves; expert_wave[e] is e's wave or 0xff when untouched
+uint32_t llama_moe_stream_layer::plan_waves(const int32_t * ids, int64_t n_tok, uint32_t n_used,
+        uint32_t n_expert, uint32_t plan_capacity, std::vector<uint8_t> & expert_wave,
+        std::vector<int32_t> & uniq) {
+    GGML_ASSERT(plan_capacity > 0 && n_expert <= 0xfe); // 0xff marks an untouched expert
+
+    expert_wave.assign(n_expert, 0xff);
+    uniq.clear();
+    for (int64_t i = 0; i < n_tok*n_used; i++) {
+        const int32_t e = ids[i];
+        if (e < 0 || (uint32_t) e >= n_expert) {
+            GGML_ABORT("MoE expert streaming: got expert id %d (valid range 0..%u)", e, n_expert - 1);
+        }
+        if (expert_wave[e] != 0xff) {
+            continue;
+        }
+        expert_wave[e] = (uint8_t) (uniq.size()/plan_capacity);
+        uniq.push_back(e);
+    }
+
+    return (uint32_t) ((uniq.size() + plan_capacity - 1)/plan_capacity);
+}
+
+void llama_moe_stream_layer::emit_wave_slots(const std::vector<uint8_t> & expert_wave, const int32_t * ids,
+        const int32_t * expert_slot, int32_t * out, int32_t w, uint32_t n_used, int64_t n_tok) {
+    for (int64_t t = 0; t < n_tok; t++) {
+        for (uint32_t kk = 0; kk < n_used; kk++) {
+            const int64_t i = t*n_used + kk;
+            const int32_t e = ids[i];
+            if (expert_wave[e] != (uint8_t) w) {
+                out[i] = -1;
+                continue;
+            }
+            out[i] = expert_slot[e];
+        }
+    }
+}
+
 // wave 0 of a ubatch: record the distinct touched experts (sl.uniq, first-use order) and split them
 // into consecutive groups of plan_capacity, one group per wave (sl.expert_wave[e] = e's wave)
-void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n) {
+void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n_tok, uint32_t n_used) {
     n_calls++;
     start_workers_locked();
 
+    const uint32_t n_waves = llama_moe_stream_layer::plan_waves(ids, n_tok, n_used, sl.n_expert,
+            sl.plan_capacity, sl.expert_wave, sl.uniq);
+
     sl.touched.assign(sl.n_expert, 0);
-    sl.uniq.clear();
-    sl.expert_wave.assign(sl.n_expert, 0xff);
-    for (int64_t i = 0; i < n; i++) {
-        const int32_t e = ids[i];
-        if (e < 0 || (uint32_t) e >= sl.n_expert) {
-            GGML_ABORT("MoE expert streaming: layer %d got expert id %d (valid range 0..%u)",
-                    sl.il, e, sl.n_expert - 1);
-        }
-        if (sl.touched[e]) {
-            continue;
-        }
+    for (const int32_t e : sl.uniq) {
         sl.touched[e] = 1;
-        sl.uniq.push_back(e);
     }
 
     update_hotness_locked(sl);
 
-    GGML_ASSERT(sl.plan_capacity > 0);
-    for (size_t i = 0; i < sl.uniq.size(); i++) {
-        GGML_ASSERT(i/sl.plan_capacity < 0xff);
-        sl.expert_wave[sl.uniq[i]] = (uint8_t) (i/sl.plan_capacity);
-    }
+    GGML_ASSERT(n_waves <= 0xff);
     sl.plan_next_wave = 0;
 }
 
@@ -1723,21 +1759,15 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
 // pairs whose expert belongs to another wave get -1 and are skipped by mul_mat_id
 void llama_moe_stream::emit_wave_slots(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out,
         int32_t w, uint32_t n_ids, int64_t n_tok) {
-    for (int64_t t = 0; t < n_tok; t++) {
-        for (uint32_t kk = 0; kk < n_ids; kk++) {
-            const int64_t i = t*n_ids + kk;
-            const int32_t e = ids[i];
-            GGML_ASSERT(sl.expert_wave[e] != 0xff);
-            if (sl.expert_wave[e] != (uint8_t) w) {
-                out[i] = -1;
-                continue;
-            }
-            const int32_t s = sl.expert_slot[e];
-            GGML_ASSERT(s >= 0);
-            GGML_ASSERT(sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_RESIDENT);
-            sl.slot_last_use[s] = ++sl.use_counter;
-            out[i] = s;
+    llama_moe_stream_layer::emit_wave_slots(sl.expert_wave, ids, sl.expert_slot.data(), out, w, n_ids, n_tok);
+
+    // LRU stamp the slots this wave uses, so eviction sees the reuse of this call
+    for (int64_t i = 0; i < n_tok*n_ids; i++) {
+        if (out[i] < 0) {
+            continue;
         }
+        GGML_ASSERT(sl.slot_state[out[i]] == LLAMA_MOE_STREAM_SLOT_RESIDENT);
+        sl.slot_last_use[out[i]] = ++sl.use_counter;
     }
 }
 
@@ -1770,7 +1800,6 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
     //   scheduler, and the view pins the previous wave's allocation for the whole graph)
     GGML_ASSERT(w == 0 || dst->src[1] != nullptr);
 
-    const int64_t   n   = ggml_nelements(a);
     const int32_t * ids = (const int32_t *) a->data;
           int32_t * out = (int32_t *) dst->data;
 
@@ -1782,12 +1811,12 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
 
     mgr->stats.n_wave_calls++;
 
+    const uint32_t n_ids = (uint32_t) a->ne[0]; // experts per token (n_expert_used)
+
     if (w == 0) {
-        mgr->plan_waves_locked(*sl, ids, n);
+        mgr->plan_waves_locked(*sl, ids, a->ne[1], n_ids);
     }
     GGML_ASSERT(sl->plan_next_wave == w); // waves must run in order (enforced by the graph ordering token)
-
-    const uint32_t n_ids = (uint32_t) a->ne[0]; // experts per token (n_expert_used)
 
     const bool host_admit = mgr->ram_hot && (!mgr->prefill_active.load(std::memory_order_relaxed) || mgr->ram_prefill);
 

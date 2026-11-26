@@ -2581,11 +2581,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     uint32_t stream_wave_cap = 0;
     if (cache.slots == nullptr && msl != nullptr) {
         const uint64_t n_touch_max = std::min<uint64_t>((uint64_t) n_expert, (uint64_t) n_tokens*n_expert_used);
-        if (n_touch_max > msl->n_slots) {
-            // the cache holds n_slots experts; a wave holds half of them so the next wave can be
-            // preloaded beside it. n_slots >= 2*n_expert_used at load keeps a wave above one
-            // token's routes, so a token's partial sums stay in its own wave
+        // a single token's routes always fit the cache (n_slots >= n_expert_used at load), so decode
+        // keeps the single-pass remap. A longer ubatch takes waves only when --moe-stream-waves asked
+        // for them: waves are not bit-exact on CPU, see docs/moe-stream-waves-exactness-20261126.md
+        const bool waves_needed = msl->mgr->waves && n_tokens > 1 &&
+            (n_tokens*n_expert_used > msl->n_slots || msl->n_slots < (uint32_t) n_expert);
+        if (waves_needed) {
             stream_wave_cap = msl->n_slots/2;
+            if (stream_wave_cap < (uint32_t) n_expert_used) {
+                GGML_ABORT("MoE expert streaming: layer %d routes %d experts per token but a wave holds only %u of %u slots; "
+                           "increase --moe-stream-cache",
+                        il, (int) n_expert_used, stream_wave_cap, msl->n_slots);
+            }
             n_stream_waves = (uint32_t) ((n_touch_max + stream_wave_cap - 1)/stream_wave_cap);
         }
         if (n_stream_waves == 1) {
@@ -2787,7 +2794,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(ids_w, "ffn_moe_wave_ids", il);
 
             ggml_tensor * e_w = build_experts(cur, selected_experts, ids_w, false, true);
-
             // ids_w holds slot ids and -1 for the other waves; step(id + 0.5) keeps this wave, drops -1
             ggml_tensor * mask_w = ggml_cast(ctx0, ids_w, GGML_TYPE_F32);
             mask_w = ggml_scale_bias(ctx0, mask_w, 1.0f, 0.5f);

@@ -19,6 +19,7 @@ struct llama_moe_stream_params {
     bool     ram_hot;     // hot host tier: dynamic per-layer cache instead of a static mirror
     bool     ram_seed;    // hot host tier: seed the dynamic cache from the static mirror content
     bool     ram_prefill; // hot host tier: also admit experts during prompt evaluation
+    bool     waves;       // multi-wave expert GEMMs: not bit-exact on CPU, see docs/moe-stream-waves-exactness-20261126.md
 };
 
 #ifdef __cplusplus

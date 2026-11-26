@@ -378,6 +378,10 @@ else()
     llama_build_and_test(test-llama-mmap.cpp LABEL behavior)
 endif()
 
+# the MoE expert streaming wave grouping, no model needed
+llama_build_and_test(test-moe-stream-waves.cpp LABEL behavior)
+target_include_directories(test-moe-stream-waves PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
 llama_build_and_test(test-autorelease.cpp       LABEL "model behavior")
