@@ -26,7 +26,7 @@ static void check_case(const char * name, const std::vector<int32_t> & ids, int6
         uint32_t n_expert, uint32_t plan_capacity, bool run_token_check) {
     const int failures_before = n_failed;
 
-    std::vector<uint8_t> expert_wave;
+    std::vector<uint16_t> expert_wave;
     std::vector<int32_t> uniq;
     const uint32_t n_waves = llama_moe_stream_layer::plan_waves(ids.data(), n_tok, n_used, n_expert,
             plan_capacity, expert_wave, uniq);
@@ -46,10 +46,10 @@ static void check_case(const char * name, const std::vector<int32_t> & ids, int6
         }
         CHECK(expect == uniq);
         for (uint32_t e = 0; e < n_expert; e++) {
-            CHECK((expert_wave[e] != 0xff) == (seen[e] != 0));
+            CHECK((expert_wave[e] != 0xffff) == (seen[e] != 0));
         }
         for (size_t i = 0; i < uniq.size(); i++) {
-            CHECK(expert_wave[uniq[i]] == (uint8_t) (i/plan_capacity));
+            CHECK(expert_wave[uniq[i]] == (uint16_t) (i/plan_capacity));
             CHECK(expert_wave[uniq[i]] < n_waves);
         }
     }
@@ -57,7 +57,7 @@ static void check_case(const char * name, const std::vector<int32_t> & ids, int6
     // a token's routes stay in one wave (the load-time invariant is n_expert_used <= plan_capacity)
     if (run_token_check) {
         for (int64_t t = 0; t < n_tok; t++) {
-            const uint8_t w = expert_wave[ids[t*n_used]];
+            const uint16_t w = expert_wave[ids[t*n_used]];
             for (uint32_t k = 1; k < n_used; k++) {
                 CHECK(expert_wave[ids[t*n_used + k]] == w);
             }
@@ -138,6 +138,20 @@ int main() {
     {
         std::vector<int32_t> ids = { 5, 9, 2, 40, 17, 63, 0, 31 };
         check_case("one token", ids, 1, 8, 64, 8, true);
+    }
+
+    // more experts than a single byte can address: the wave index and the untouched marker no
+    // longer collide (512 experts, 8 per wave -> 64 waves)
+    {
+        const int64_t  n_tok = 64;
+        const uint32_t n_used = 8, n_expert = 512;
+        std::vector<int32_t> ids(n_tok*n_used);
+        for (int64_t t = 0; t < n_tok; t++) {
+            for (uint32_t k = 0; k < n_used; k++) {
+                ids[t*n_used + k] = (int32_t) ((t*n_used + k) % n_expert);
+            }
+        }
+        check_case("512 experts", ids, n_tok, n_used, n_expert, 8, true);
     }
 
     if (n_failed != 0) {

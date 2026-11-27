@@ -1601,36 +1601,37 @@ llama_moe_stream_wave * llama_moe_stream_layer::wave_userdata(int32_t wave, uint
 }
 
 // splits the touched experts of a ubatch into waves: consecutive first-use order, plan_capacity
-// experts per wave. Returns the number of waves; expert_wave[e] is e's wave or 0xff when untouched
+// experts per wave. Returns the number of waves; expert_wave[e] is e's wave or 0xffff when untouched
 uint32_t llama_moe_stream_layer::plan_waves(const int32_t * ids, int64_t n_tok, uint32_t n_used,
-        uint32_t n_expert, uint32_t plan_capacity, std::vector<uint8_t> & expert_wave,
+        uint32_t n_expert, uint32_t plan_capacity, std::vector<uint16_t> & expert_wave,
         std::vector<int32_t> & uniq) {
-    GGML_ASSERT(plan_capacity > 0 && n_expert <= 0xfe); // 0xff marks an untouched expert
+    GGML_ASSERT(plan_capacity > 0 && n_expert <= 0xfffe); // 0xffff marks an untouched expert
 
-    expert_wave.assign(n_expert, 0xff);
+    expert_wave.assign(n_expert, 0xffff);
     uniq.clear();
     for (int64_t i = 0; i < n_tok*n_used; i++) {
         const int32_t e = ids[i];
         if (e < 0 || (uint32_t) e >= n_expert) {
             GGML_ABORT("MoE expert streaming: got expert id %d (valid range 0..%u)", e, n_expert - 1);
         }
-        if (expert_wave[e] != 0xff) {
+        if (expert_wave[e] != 0xffff) {
             continue;
         }
-        expert_wave[e] = (uint8_t) (uniq.size()/plan_capacity);
+        // (uniq.size() + plan_capacity - 1)/plan_capacity <= n_expert so the wave index fits
+        expert_wave[e] = (uint16_t) (uniq.size()/plan_capacity);
         uniq.push_back(e);
     }
 
     return (uint32_t) ((uniq.size() + plan_capacity - 1)/plan_capacity);
 }
 
-void llama_moe_stream_layer::emit_wave_slots(const std::vector<uint8_t> & expert_wave, const int32_t * ids,
+void llama_moe_stream_layer::emit_wave_slots(const std::vector<uint16_t> & expert_wave, const int32_t * ids,
         const int32_t * expert_slot, int32_t * out, int32_t w, uint32_t n_used, int64_t n_tok) {
     for (int64_t t = 0; t < n_tok; t++) {
         for (uint32_t kk = 0; kk < n_used; kk++) {
             const int64_t i = t*n_used + kk;
             const int32_t e = ids[i];
-            if (expert_wave[e] != (uint8_t) w) {
+            if (expert_wave[e] != (uint16_t) w) {
                 out[i] = -1;
                 continue;
             }
