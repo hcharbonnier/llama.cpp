@@ -1235,6 +1235,42 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     return info;
 }
 
+bool common_fit_ngl_requests_all(const llama_model_params & mparams, int32_t n_layer) {
+    // fit uses -1 as "unset", tools that build llama_model_params directly cannot tell it apart from "auto"
+    const int32_t ngl = mparams.n_gpu_layers;
+    if (ngl == -1) {
+        return false;
+    }
+    return ngl < 0 || ngl >= n_layer;
+}
+
+// moe stream clamps an explicit request for all layers: one device cannot hold the model and the expert cache
+// needs the layer split, which fit only picks when n_gpu_layers is unset
+static void apply_stream_ngl_clamp(common_params & params) {
+    if (!params.moe_stream.enabled || params.n_gpu_layers == -1) {
+        return;
+    }
+
+    llama_model_params mparams = common_model_params_to_llama(params);
+    mparams.no_alloc  = true;
+    mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+
+    llama_model_ptr model(common_model_load(params.model.get_paths(), mparams));
+    if (!model) {
+        throw std::runtime_error("failed to load model");
+    }
+    if (!llama_model_moe_stream_enabled(model.get()) || llama_model_n_devices(model.get()) != 1) {
+        return;
+    }
+    if (!common_fit_ngl_requests_all(mparams, llama_model_n_layer(model.get()))) {
+        return;
+    }
+
+    LOG_WRN("%s: MoE expert streaming: -ngl %" PRId32 " requests all layers, the fit must choose the split for the expert cache, using n_gpu_layers = -1\n",
+            __func__, params.n_gpu_layers);
+    params.n_gpu_layers = -1;
+}
+
 void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
     if (!params.fit_params) {
         return;
@@ -1249,6 +1285,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     common_params params_dft = common_base_params_to_speculative(params);
+    apply_stream_ngl_clamp(params_dft);
 
     auto mparams_dft = common_model_params_to_llama(params_dft);
     auto cparams_dft = common_context_params_to_llama(params_dft);
@@ -1256,6 +1293,10 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
     cparams_dft.n_rs_seq = 0;
+
+    // clamp before any memory measurement: a fully offloaded MoE with streamed experts does not fit on one device,
+    // without the clamp the fit aborts before it can pick the split
+    apply_stream_ngl_clamp(params);
 
     const common_fit_extra_model extra = {
         /*.paths_model  =*/ params_dft.model.get_paths(),
@@ -1271,6 +1312,9 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         params.fit_params_min_ctx,
         has_draft || spec_mtp ? &extra : nullptr,
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+    // common_fit_params only reaches the model params, the next setup builds them from common_params again
+    mparams.n_gpu_layers = params.n_gpu_layers;
 }
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
