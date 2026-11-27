@@ -106,7 +106,7 @@ struct llama_moe_stream_layer {
     // consecutive passes of at most plan_capacity experts each, run one pass at a time
     uint32_t plan_capacity  = 0;  // experts per wave, set at graph build
     int32_t  plan_next_wave = -1; // wave expected to run next (ordering guard)
-    std::vector<uint8_t> expert_wave; // [n_expert] wave of each touched expert, 0xff = untouched
+    std::vector<uint16_t> expert_wave; // [n_expert] wave of each touched expert, 0xffff = untouched
     std::vector<std::unique_ptr<llama_moe_stream_wave>> wave_ud; // stable per-wave userdata
 
     // the docs shared by the load-time checks and the deterministic test - keep in sync with the
@@ -114,13 +114,13 @@ struct llama_moe_stream_layer {
 
     // place each distinct touched expert (ids of n_tok tokens, n_used routes each) in its wave:
     // consecutive first-use order, plan_capacity experts per wave. Returns the number of waves.
-    // uniq (n_expert) receives the distinct experts in first-use order, 0xff marks an expert that
+    // uniq (n_expert) receives the distinct experts in first-use order, 0xffff marks an expert that
     // the ubatch does not touch.
     static uint32_t plan_waves(const int32_t * ids, int64_t n_tok, uint32_t n_used, uint32_t n_expert,
-            uint32_t plan_capacity, std::vector<uint8_t> & expert_wave, std::vector<int32_t> & uniq);
+            uint32_t plan_capacity, std::vector<uint16_t> & expert_wave, std::vector<int32_t> & uniq);
 
     // write out the slot id of each pair owned by wave w, -1 for the pairs of the other waves
-    static void emit_wave_slots(const std::vector<uint8_t> & expert_wave, const int32_t * ids,
+    static void emit_wave_slots(const std::vector<uint16_t> & expert_wave, const int32_t * ids,
             const int32_t * expert_slot, int32_t * out, int32_t w, uint32_t n_used, int64_t n_tok);
 
     // stable userdata for wave w (grows lazily); called at graph build time only
