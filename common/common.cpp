@@ -1235,13 +1235,9 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     return info;
 }
 
-bool common_fit_ngl_requests_all(const llama_model_params & mparams, int32_t n_layer) {
-    // fit uses -1 as "unset", tools that build llama_model_params directly cannot tell it apart from "auto"
-    const int32_t ngl = mparams.n_gpu_layers;
-    if (ngl == -1) {
-        return false;
-    }
-    return ngl < 0 || ngl >= n_layer;
+// -2 means all layers in the CLI parser and n_gpu_layers < 0 offloads everything
+static bool ngl_requests_all(int32_t n_gpu_layers, int32_t n_layer) {
+    return n_gpu_layers < 0 || n_gpu_layers >= n_layer;
 }
 
 // moe stream clamps an explicit request for all layers: one device cannot hold the model and the expert cache
@@ -1262,7 +1258,7 @@ static void apply_stream_ngl_clamp(common_params & params) {
     if (!llama_model_moe_stream_enabled(model.get()) || llama_model_n_devices(model.get()) != 1) {
         return;
     }
-    if (!common_fit_ngl_requests_all(mparams, llama_model_n_layer(model.get()))) {
+    if (!ngl_requests_all(params.n_gpu_layers, llama_model_n_layer(model.get()))) {
         return;
     }
 
