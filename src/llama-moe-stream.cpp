@@ -501,9 +501,10 @@ void llama_moe_stream::fill_host_mirror() {
     size_t   n_mirrored   = 0;
     bool     pinned       = true;
     bool     all_budget   = true; // no layer was skipped except for lack of budget
-    size_t   nb_min       = SIZE_MAX;
-    size_t   nb_max       = 0;
+    size_t   nb_min       = SIZE_MAX;          // one expert, per layer
+    size_t   nb_max       = 0;                 // one expert, per layer
     size_t   nb_cand      = 0;                 // layers that were candidates for a job
+    uint64_t nb_cand_mean = 0;                 // mean one-expert size over the candidates
     uint64_t nb_cand_sum  = 0;                 // one expert bytes per candidate layer, summed
     std::vector<uint64_t> nb_experts(n_mirror_layers);
 
@@ -525,8 +526,12 @@ void llama_moe_stream::fill_host_mirror() {
 
         nb_cand++;
         nb_cand_sum += nb_expert;
-        nb_min = std::min(nb_min, nb_expert);
-        nb_max = std::max(nb_max, nb_expert);
+        if (n_expert > 0) {
+            const size_t nb_one = nb_expert / n_expert; // one expert, not the layer total
+            nb_min = std::min(nb_min, nb_one);
+            nb_max = std::max(nb_max, nb_one);
+            nb_cand_mean += nb_one;
+        }
         nb_experts[nb_cand - 1] = nb_expert;
 
         const uint32_t n_host_expert = (uint32_t) std::min<uint64_t>(n_expert, budget_per_layer / nb_expert);
@@ -582,10 +587,10 @@ void llama_moe_stream::fill_host_mirror() {
 
     if (jobs.empty()) {
         if (n_device > 0 && all_budget) {
-            const double nb_cand_mean = nb_cand_sum / (double) nb_cand;
-            LLAMA_LOG_WARN("%s: host mirror budget %.2f GiB (effective, after the RAM cap) cannot hold one expert per layer: %.2f GiB per layer over %u layer(s), one expert is %.2f to %.2f MiB (mean %.2f MiB) -- needs about %.2f GiB, raise --moe-stream-ram\n",
+            const double nb_mean = nb_cand > 0 ? nb_cand_mean / (double) nb_cand : 0.0;
+            LLAMA_LOG_WARN("%s: host mirror budget %.2f GiB (effective, after the RAM cap) cannot hold one expert per layer: %.2f GiB per layer over %u layer(s), one expert is %.2f to %.2f MiB (mean %.2f MiB) -- mirroring one expert on each layer needs %.2f GiB in total, raise --moe-stream-ram\n",
                     __func__, ram_budget / 1024.0 / 1024.0 / 1024.0, budget_per_layer / 1024.0 / 1024.0 / 1024.0,
-                    n_mirror_layers, nb_min / 1024.0 / 1024.0, nb_max / 1024.0 / 1024.0, nb_cand_mean / 1024.0 / 1024.0,
+                    n_mirror_layers, nb_min / 1024.0 / 1024.0, nb_max / 1024.0 / 1024.0, nb_mean / 1024.0 / 1024.0,
                     llama_moe_stream_mirror_budget_needed(nb_experts.data(), nb_cand, ram_cap) / 1024.0 / 1024.0 / 1024.0);
         } else {
             LLAMA_LOG_WARN("%s: no layer could be mirrored, host mirror disabled\n", __func__);
