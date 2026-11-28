@@ -427,6 +427,7 @@ void llama_moe_stream::fill_host_mirror() {
 
     const uint64_t ram_free = llama_moe_stream_phys_avail();
     const uint64_t ram_cap  = ram_free > 0 ? ram_free * MOE_STREAM_RAM_FREE_PERCENT / 100 : 0;
+    const uint64_t ram_budget_asked = ram_budget; // as requested, before any clamp
 
     if (ram_auto) {
         if (ram_cap == 0) {
@@ -649,9 +650,11 @@ void llama_moe_stream::fill_host_mirror() {
 
         if (n_skip[SKIP_BUDGET_ZERO] == n_mirror_layers) {
             const double nb_mean = nb_cand > 0 ? nb_cand_sum / (double) nb_cand : 0.0;
-            LLAMA_LOG_WARN("%s: host mirror budget %.2f GiB cannot hold one expert per layer: %.2f MiB per layer over %u layer(s), one expert is %.2f to %.2f MiB (mean %.2f MiB) -- one expert on each layer needs %.2f GiB, raise --moe-stream-ram\n",
-                    __func__, budget_granted / 1024.0 / 1024.0 / 1024.0, budget_per_layer / 1024.0 / 1024.0,
-                    n_mirror_layers, nb_min / 1024.0 / 1024.0, nb_max / 1024.0 / 1024.0, nb_mean / 1024.0 / 1024.0,
+            LLAMA_LOG_WARN("%s: host mirror budget %.2f GiB (asked %.2f, RAM available %.2f, cap %.2f) cannot hold one expert per layer: %.2f MiB per layer over %u layer(s), one expert is %.2f to %.2f MiB (mean %.2f MiB) -- one expert on each layer needs %.2f GiB, raise --moe-stream-ram\n",
+                    __func__, budget_granted / 1024.0 / 1024.0 / 1024.0, ram_budget_asked / 1024.0 / 1024.0 / 1024.0,
+                    ram_free / 1024.0 / 1024.0 / 1024.0, ram_cap / 1024.0 / 1024.0 / 1024.0,
+                    budget_per_layer / 1024.0 / 1024.0, n_mirror_layers,
+                    nb_min / 1024.0 / 1024.0, nb_max / 1024.0 / 1024.0, nb_mean / 1024.0 / 1024.0,
                     llama_moe_stream_mirror_one_expert_budget(nb_one_experts.data(), nb_one_experts.size()) / 1024.0 / 1024.0 / 1024.0);
         } else {
             // compact list of the reasons that actually occurred
@@ -665,10 +668,11 @@ void llama_moe_stream::fill_host_mirror() {
                 reason += format("%u %s", n_skip[r], skip_names[r]);
                 n_skip_total += n_skip[r];
             }
-            LLAMA_LOG_WARN("%s: no job created: %u/%u layer(s) skipped (%s); first: layer %d %s (n_host_expert %u), budget_per_layer %.2f MiB, one expert %.2f MiB\n",
+            LLAMA_LOG_WARN("%s: no job created: %u/%u layer(s) skipped (%s); first: layer %d %s (n_host_expert %u), budget_per_layer %.2f MiB, one expert %.2f MiB (budget %.2f GiB, RAM available %.2f, cap %.2f)\n",
                     __func__, n_skip_total, n_mirror_layers,
                     reason.c_str(), first_skip, first_name, first_skip_n_host,
-                    first_skip_budget, first_skip_expert);
+                    first_skip_budget, first_skip_expert,
+                    budget_granted / 1024.0 / 1024.0 / 1024.0, ram_free / 1024.0 / 1024.0 / 1024.0, ram_cap / 1024.0 / 1024.0 / 1024.0);
         }
         host_bufs.clear();
         return;
