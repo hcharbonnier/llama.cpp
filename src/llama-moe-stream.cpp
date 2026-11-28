@@ -650,8 +650,11 @@ void llama_moe_stream::fill_host_mirror() {
 
         if (n_skip[SKIP_BUDGET_ZERO] == n_mirror_layers) {
             const double nb_mean = nb_cand > 0 ? nb_cand_sum / (double) nb_cand : 0.0;
-            LLAMA_LOG_WARN("%s: host mirror budget %.2f GiB (asked %.2f, RAM available %.2f, cap %.2f) cannot hold one expert per layer: %.2f MiB per layer over %u layer(s), one expert is %.2f to %.2f MiB (mean %.2f MiB) -- one expert on each layer needs %.2f GiB, raise --moe-stream-ram\n",
-                    __func__, budget_granted / 1024.0 / 1024.0 / 1024.0, ram_budget_asked / 1024.0 / 1024.0 / 1024.0,
+            // a bare --moe-stream-ram N means N bytes, often meant as GiB
+            static const char * budget_hint = ram_budget_asked > 0 && ram_budget_asked < 1024*1024
+                    ? ", the value has no G/M suffix, so it was read as bytes: add G/M or use auto" : "";
+            LLAMA_LOG_WARN("%s: host mirror budget %.2f GiB (asked %" PRIu64 " B%s; RAM available %.2f, cap %.2f) cannot hold one expert per layer: %.2f MiB per layer over %u layer(s), one expert is %.2f to %.2f MiB (mean %.2f MiB) -- one expert on each layer needs %.2f GiB, raise --moe-stream-ram\n",
+                    __func__, budget_granted / 1024.0 / 1024.0 / 1024.0, ram_budget_asked, budget_hint,
                     ram_free / 1024.0 / 1024.0 / 1024.0, ram_cap / 1024.0 / 1024.0 / 1024.0,
                     budget_per_layer / 1024.0 / 1024.0, n_mirror_layers,
                     nb_min / 1024.0 / 1024.0, nb_max / 1024.0 / 1024.0, nb_mean / 1024.0 / 1024.0,
