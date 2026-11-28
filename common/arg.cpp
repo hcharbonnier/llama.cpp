@@ -2824,6 +2824,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 if (n > 0xffffffffffffffffull/1024ull/1024ull/1024ull) {
                     throw std::invalid_argument("invalid value, budget is too large");
                 }
+                if (suffix.empty()) {
+                    LOG_WRN("--moe-stream-cache %s: no suffix, the value is read as %" PRIu64 " GiB; add G for GiB or s for slots\n", value.c_str(), n);
+                }
                 params.moe_stream.budget = n * 1024ull * 1024ull * 1024ull;
                 params.moe_stream.slots  = 0;
             } else {
@@ -2890,6 +2893,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             uint64_t mult = 1;
             if (suffix.empty() || suffix == "b") {
                 mult = 1;
+                // no suffix means bytes, not GiB (the old --moe-stream-cache unit); a bare 110 is 110 B
+                if (suffix.empty()) {
+                    LOG_WRN("--moe-stream-ram %s: no suffix, the value is read as %" PRIu64 " bytes, not GiB; add G (or M) or use auto\n", value.c_str(), n);
+                }
             } else if (suffix == "k" || suffix == "kb" || suffix == "kib") {
                 mult = 1024ull;
             } else if (suffix == "m" || suffix == "mb" || suffix == "mib") {

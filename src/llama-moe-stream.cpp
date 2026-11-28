@@ -428,6 +428,8 @@ void llama_moe_stream::fill_host_mirror() {
         return;
     }
 
+    const uint64_t ram_budget_asked = ram_budget; // to report the requested size in the warnings
+
     const uint64_t ram_free = llama_moe_stream_phys_avail();
     const uint64_t ram_cap  = ram_free > 0 ? ram_free * MOE_STREAM_RAM_FREE_PERCENT / 100 : 0;
 
@@ -592,8 +594,17 @@ void llama_moe_stream::fill_host_mirror() {
                     __func__, ram_budget / 1024.0 / 1024.0 / 1024.0, budget_per_layer / 1024.0 / 1024.0 / 1024.0,
                     n_mirror_layers, nb_min / 1024.0 / 1024.0, nb_max / 1024.0 / 1024.0, nb_mean / 1024.0 / 1024.0,
                     llama_moe_stream_mirror_budget_needed(nb_experts.data(), nb_cand, ram_cap) / 1024.0 / 1024.0 / 1024.0);
+            if (ram_budget < 1024ull*1024) {
+                // a bare value without a suffix can land here, being read as bytes: name it
+                LLAMA_LOG_WARN("%s: host mirror budget is %" PRIu64 " B (asked %" PRIu64 " B), below one expert\n",
+                        __func__, ram_budget, ram_budget_asked);
+            }
         } else {
             LLAMA_LOG_WARN("%s: no layer could be mirrored, host mirror disabled\n", __func__);
+            if (!ram_auto && ram_budget < 1024ull*1024) {
+                LLAMA_LOG_WARN("%s: host mirror budget is %" PRIu64 " B (asked %" PRIu64 " B), below one expert\n",
+                        __func__, ram_budget, ram_budget_asked);
+            }
         }
         host_bufs.clear();
         return;
