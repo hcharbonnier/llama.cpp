@@ -425,9 +425,10 @@ void llama_moe_stream::fill_host_mirror() {
         return;
     }
 
+    const uint64_t ram_budget_asked = ram_budget; // as requested, before any clamp
+
     const uint64_t ram_free = llama_moe_stream_phys_avail();
     const uint64_t ram_cap  = ram_free > 0 ? ram_free * MOE_STREAM_RAM_FREE_PERCENT / 100 : 0;
-    const uint64_t ram_budget_asked = ram_budget; // as requested, before any clamp
 
     if (ram_auto) {
         if (ram_cap == 0) {

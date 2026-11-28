@@ -371,6 +371,30 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), p_fitt, LLAMA_EXAMPLE_COMMON));
     }
 
+    {
+        // a bare --moe-stream-ram value is bytes, a G suffix is GiB
+        common_params ram_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--moe-stream-ram", "40"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ram_params, LLAMA_EXAMPLE_COMMON));
+        assert(ram_params.moe_stream.ram == 40);
+        assert(!ram_params.moe_stream.ram_auto);
+
+        argv = {"binary_name", "-m", "model_file.gguf", "--moe-stream-ram", "40G"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ram_params, LLAMA_EXAMPLE_COMMON));
+        assert(ram_params.moe_stream.ram == 40ull*1024*1024*1024);
+
+        argv = {"binary_name", "-m", "model_file.gguf", "--moe-stream-ram", "auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ram_params, LLAMA_EXAMPLE_COMMON));
+        assert(ram_params.moe_stream.ram_auto);
+
+        // --moe-stream-cache has no byte unit: a bare value is GiB
+        common_params cache_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--moe-stream-cache", "40"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_COMMON));
+        assert(cache_params.moe_stream.budget == 40ull*1024*1024*1024);
+        assert(cache_params.moe_stream.slots == 0);
+    }
+
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32
     printf("test-arg-parser: skip on windows build\n");
