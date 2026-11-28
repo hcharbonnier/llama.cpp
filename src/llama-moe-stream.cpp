@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <atomic>
 
@@ -406,18 +407,14 @@ void llama_moe_stream::clamp_io_staging() {
             MOE_STREAM_STAGING_MAX / 1024.0 / 1024.0);
 }
 
-// budget that mirrors one expert on every candidate layer: each needs n_layers * its expert bytes,
-// clamped to the same RAM cap as the mirror budget
-static uint64_t llama_moe_stream_mirror_budget_needed(const uint64_t * nb_expert, size_t n, uint64_t ram_cap) {
-    if (ram_cap == 0) {
-        return 0; // no budget fits under the cap
-    }
+// budget that mirrors one expert on every candidate layer: the sum of one expert per layer, no cap
+static uint64_t llama_moe_stream_mirror_one_expert_budget(const uint64_t * nb_one_expert, size_t n) {
     uint64_t want = 0;
     for (size_t i = 0; i < n; ++i) {
-        const uint64_t need = nb_expert[i] > ram_cap ? UINT64_MAX : nb_expert[i] * n;
+        const uint64_t need = nb_one_expert[i];
         want = want > UINT64_MAX - need ? UINT64_MAX : want + need;
     }
-    return std::min(want, ram_cap);
+    return want;
 }
 
 // mirror an even share of the experts of every streamed layer in host memory, so their device
@@ -449,6 +446,9 @@ void llama_moe_stream::fill_host_mirror() {
     if (ram_budget == 0) {
         return;
     }
+
+    // budget really granted: ram_budget is the effective value after the RAM cap
+    const uint64_t budget_granted = ram_budget;
 
     const int64_t t_start = ggml_time_us();
 
@@ -500,13 +500,44 @@ void llama_moe_stream::fill_host_mirror() {
     uint32_t n_layers     = 0;
     size_t   n_mirrored   = 0;
     bool     pinned       = true;
-    bool     all_budget   = true; // no layer was skipped except for lack of budget
     size_t   nb_min       = SIZE_MAX;          // one expert, per layer
     size_t   nb_max       = 0;                 // one expert, per layer
     size_t   nb_cand      = 0;                 // layers that were candidates for a job
-    uint64_t nb_cand_mean = 0;                 // mean one-expert size over the candidates
     uint64_t nb_cand_sum  = 0;                 // one expert bytes per candidate layer, summed
-    std::vector<uint64_t> nb_experts(n_mirror_layers);
+    std::vector<uint64_t> nb_one_experts;      // one expert per candidate layer
+
+    // reasons a layer gets no mirror job; the first skip keeps its key values for the warning
+    enum skip_reason {
+        SKIP_HOST_CACHE, // the cache already lives in host memory
+        SKIP_EXPERT_ZERO, // the layer reports no expert bytes
+        SKIP_BUDGET_ZERO, // the per-layer budget cannot hold one expert
+        SKIP_OVERFLOW,   // the mirror size overflows size_t
+        SKIP_ALLOC_FAIL, // the host buffer cannot be allocated
+        SKIP_NO_HOST_BASE, // the host buffer exposes no host pointer
+        SKIP_COUNT,
+    };
+    static const char * const skip_names[SKIP_COUNT] = {
+        "cache already in host memory", "no expert bytes", "budget too small",
+        "size overflow", "allocation failed", "no host base",
+    };
+    uint32_t n_skip[SKIP_COUNT] = { 0 };
+    int32_t  first_skip        = -1;
+    int32_t  first_skip_reason = -1;
+    uint32_t first_skip_n_host = 0;
+    double   first_skip_budget = 0.0;
+    double   first_skip_expert = 0.0;
+
+    // count a skip and keep the key values of the first one
+    auto record_skip = [&](skip_reason r, int32_t il, uint32_t n_host_expert, double nb_expert) {
+        n_skip[r]++;
+        if (first_skip < 0) {
+            first_skip        = il;
+            first_skip_reason = r;
+            first_skip_n_host = n_host_expert;
+            first_skip_budget = budget_per_layer / 1024.0 / 1024.0;
+            first_skip_expert = nb_expert / 1024.0 / 1024.0;
+        }
+    };
 
     for (auto & sl_ptr : layers) {
         if (sl_ptr == nullptr) {
@@ -515,32 +546,41 @@ void llama_moe_stream::fill_host_mirror() {
         auto & sl = *sl_ptr;
 
         if (ggml_backend_buffer_is_host(sl.weights[0].cache->buffer)) {
+            record_skip(SKIP_HOST_CACHE, sl.il, 0, 0.0);
             continue;
         }
 
         const size_t   nb_expert = expert_bytes(sl);
         const uint32_t n_expert  = sl.n_expert;
-        if (nb_expert == 0) {
+        if (nb_expert == 0 || n_expert == 0) {
+            record_skip(SKIP_EXPERT_ZERO, sl.il, 0, 0.0);
             continue;
         }
 
+        const size_t nb_one = nb_expert / n_expert; // one expert, not the layer total
         nb_cand++;
-        nb_cand_sum += nb_expert;
-        if (n_expert > 0) {
-            const size_t nb_one = nb_expert / n_expert; // one expert, not the layer total
-            nb_min = std::min(nb_min, nb_one);
-            nb_max = std::max(nb_max, nb_one);
-            nb_cand_mean += nb_one;
-        }
-        nb_experts[nb_cand - 1] = nb_expert;
+        nb_cand_sum += nb_one;
+        nb_one_experts.push_back(nb_one);
+        nb_min = std::min(nb_min, nb_one);
+        nb_max = std::max(nb_max, nb_one);
 
         const uint32_t n_host_expert = (uint32_t) std::min<uint64_t>(n_expert, budget_per_layer / nb_expert);
         if (n_host_expert == 0) {
+            record_skip(SKIP_BUDGET_ZERO, sl.il, 0, nb_expert);
+            if (debug) {
+                LLAMA_LOG_DEBUG("%s: layer %d skipped (%s): n_expert = %u, nb_expert = %.2f MiB, n_host_expert = 0, budget_per_layer = %.2f MiB\n",
+                        __func__, sl.il, skip_names[SKIP_BUDGET_ZERO], n_expert, nb_expert / 1024.0 / 1024.0,
+                        budget_per_layer / 1024.0 / 1024.0);
+            }
             continue;
         }
         if (nb_expert > SIZE_MAX / n_host_expert) {
-            all_budget = false; // skipped for another reason than the budget
-            LLAMA_LOG_WARN("%s: host mirror size overflows at layer %d, layer reads from file\n", __func__, sl.il);
+            record_skip(SKIP_OVERFLOW, sl.il, n_host_expert, nb_expert);
+            if (debug) {
+                LLAMA_LOG_DEBUG("%s: layer %d skipped (%s): n_expert = %u, nb_expert = %.2f MiB, n_host_expert = %u, budget_per_layer = %.2f MiB\n",
+                        __func__, sl.il, skip_names[SKIP_OVERFLOW], n_expert, nb_expert / 1024.0 / 1024.0,
+                        n_host_expert, budget_per_layer / 1024.0 / 1024.0);
+            }
             continue;
         }
 
@@ -562,12 +602,24 @@ void llama_moe_stream::fill_host_mirror() {
 
         ggml_backend_buffer_ptr buf { ggml_backend_buft_alloc_buffer(buft, nb_layer) };
         if (!buf) {
+            record_skip(SKIP_ALLOC_FAIL, sl.il, n_host_expert, nb_expert);
+            if (debug) {
+                LLAMA_LOG_DEBUG("%s: layer %d skipped (%s): n_expert = %u, nb_expert = %.2f MiB, n_host_expert = %u, %.2f MiB, budget_per_layer = %.2f MiB\n",
+                        __func__, sl.il, skip_names[SKIP_ALLOC_FAIL], n_expert, nb_expert / 1024.0 / 1024.0,
+                        n_host_expert, nb_layer / 1024.0 / 1024.0, budget_per_layer / 1024.0 / 1024.0);
+            }
             LLAMA_LOG_WARN("%s: host mirror allocation failed at layer %d, layer reads from file\n", __func__, sl.il);
             continue;
         }
 
         uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf.get());
         if (base == nullptr || !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buf.get()))) {
+            record_skip(SKIP_NO_HOST_BASE, sl.il, n_host_expert, nb_expert);
+            if (debug) {
+                LLAMA_LOG_DEBUG("%s: layer %d skipped (%s): n_expert = %u, nb_expert = %.2f MiB, n_host_expert = %u, %.2f MiB, budget_per_layer = %.2f MiB\n",
+                        __func__, sl.il, skip_names[SKIP_NO_HOST_BASE], n_expert, nb_expert / 1024.0 / 1024.0,
+                        n_host_expert, nb_layer / 1024.0 / 1024.0, budget_per_layer / 1024.0 / 1024.0);
+            }
             LLAMA_LOG_WARN("%s: host mirror buffer has no host base at layer %d, layer reads from file\n", __func__, sl.il);
             continue;
         }
@@ -586,14 +638,37 @@ void llama_moe_stream::fill_host_mirror() {
     }
 
     if (jobs.empty()) {
-        if (n_device > 0 && all_budget) {
-            const double nb_mean = nb_cand > 0 ? nb_cand_mean / (double) nb_cand : 0.0;
-            LLAMA_LOG_WARN("%s: host mirror budget %.2f GiB (effective, after the RAM cap) cannot hold one expert per layer: %.2f GiB per layer over %u layer(s), one expert is %.2f to %.2f MiB (mean %.2f MiB) -- mirroring one expert on each layer needs %.2f GiB in total, raise --moe-stream-ram\n",
-                    __func__, ram_budget / 1024.0 / 1024.0 / 1024.0, budget_per_layer / 1024.0 / 1024.0 / 1024.0,
+        if (n_mirror_layers == 0) {
+            if (n_host > 0 && n_device == 0) {
+                LLAMA_LOG_WARN("%s: expert cache is in host memory, host mirror is redundant -- disabled\n", __func__);
+            }
+            return;
+        }
+
+        const char * first_name = first_skip_reason >= 0 ? skip_names[first_skip_reason] : "none";
+
+        if (n_skip[SKIP_BUDGET_ZERO] == n_mirror_layers) {
+            const double nb_mean = nb_cand > 0 ? nb_cand_sum / (double) nb_cand : 0.0;
+            LLAMA_LOG_WARN("%s: host mirror budget %.2f GiB cannot hold one expert per layer: %.2f MiB per layer over %u layer(s), one expert is %.2f to %.2f MiB (mean %.2f MiB) -- one expert on each layer needs %.2f GiB, raise --moe-stream-ram\n",
+                    __func__, budget_granted / 1024.0 / 1024.0 / 1024.0, budget_per_layer / 1024.0 / 1024.0,
                     n_mirror_layers, nb_min / 1024.0 / 1024.0, nb_max / 1024.0 / 1024.0, nb_mean / 1024.0 / 1024.0,
-                    llama_moe_stream_mirror_budget_needed(nb_experts.data(), nb_cand, ram_cap) / 1024.0 / 1024.0 / 1024.0);
+                    llama_moe_stream_mirror_one_expert_budget(nb_one_experts.data(), nb_one_experts.size()) / 1024.0 / 1024.0 / 1024.0);
         } else {
-            LLAMA_LOG_WARN("%s: no layer could be mirrored, host mirror disabled\n", __func__);
+            // compact list of the reasons that actually occurred
+            std::string reason;
+            uint32_t n_skip_total = 0;
+            for (int r = 0; r < SKIP_COUNT; ++r) {
+                if (n_skip[r] == 0) {
+                    continue;
+                }
+                reason += reason.empty() ? "" : ", ";
+                reason += format("%u %s", n_skip[r], skip_names[r]);
+                n_skip_total += n_skip[r];
+            }
+            LLAMA_LOG_WARN("%s: no job created: %u/%u layer(s) skipped (%s); first: layer %d %s (n_host_expert %u), budget_per_layer %.2f MiB, one expert %.2f MiB\n",
+                    __func__, n_skip_total, n_mirror_layers,
+                    reason.c_str(), first_skip, first_name, first_skip_n_host,
+                    first_skip_budget, first_skip_expert);
         }
         host_bufs.clear();
         return;
